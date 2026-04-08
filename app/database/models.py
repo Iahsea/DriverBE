@@ -49,6 +49,10 @@ class User(Base):
     rooms = relationship("Room", back_populates="created_by_user", foreign_keys="Room.created_by_id")
     room_members = relationship("RoomMember", back_populates="user", cascade="all, delete-orphan")
     messages = relationship("Message", back_populates="sender", cascade="all, delete-orphan")
+    friend_requests_sent = relationship("FriendRequest", back_populates="from_user", foreign_keys="FriendRequest.from_user_id", cascade="all, delete-orphan")
+    friend_requests_received = relationship("FriendRequest", back_populates="to_user", foreign_keys="FriendRequest.to_user_id", cascade="all, delete-orphan")
+    friendships_1 = relationship("Friendship", back_populates="user_1", foreign_keys="Friendship.user_id_1", cascade="all, delete-orphan")
+    friendships_2 = relationship("Friendship", back_populates="user_2", foreign_keys="Friendship.user_id_2", cascade="all, delete-orphan")
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, username='{self.username}', email='{self.email}')>"
@@ -159,3 +163,59 @@ class Message(Base):
 
     def __repr__(self) -> str:
         return f"<Message(id={self.id[:8]}, room={self.room_id[:8]}, sender={self.sender_id[:8]})>"
+
+
+class FriendRequest(Base):
+    """
+    FriendRequest Model - Quản lý lời mời kết bạn.
+    
+    Attributes:
+        id: UUID primary key
+        from_user_id: ID của user gửi lời mời
+        to_user_id: ID của user nhận lời mời
+        status: pending, accepted, rejected, canceled
+        created_at: Thời gian gửi lời mời
+        updated_at: Thời gian cập nhật
+    """
+    __tablename__ = "friend_requests"
+
+    id = Column(String(36), primary_key=True, default=lambda: uuid.uuid4().hex, nullable=False)
+    from_user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    to_user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(20), default="pending", nullable=False)  # pending, accepted, rejected, canceled
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # Relationships
+    from_user = relationship("User", back_populates="friend_requests_sent", foreign_keys=[from_user_id])
+    to_user = relationship("User", back_populates="friend_requests_received", foreign_keys=[to_user_id])
+
+    def __repr__(self) -> str:
+        return f"<FriendRequest(from={self.from_user_id[:8]}, to={self.to_user_id[:8]}, status={self.status})>"
+
+
+class Friendship(Base):
+    """
+    Friendship Model - Các cặp bạn bè đã chấp nhận lời mời.
+    
+    Note: user_id_1 < user_id_2 để tránh duplicates (A-B == B-A).
+    
+    Attributes:
+        id: UUID primary key
+        user_id_1: ID user 1 (nhỏ hơn user_id_2)
+        user_id_2: ID user 2 (lớn hơn user_id_1)
+        created_at: Thời gian trở thành bạn
+    """
+    __tablename__ = "friendships"
+
+    id = Column(String(36), primary_key=True, default=lambda: uuid.uuid4().hex, nullable=False)
+    user_id_1 = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id_2 = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Relationships
+    user_1 = relationship("User", back_populates="friendships_1", foreign_keys=[user_id_1])
+    user_2 = relationship("User", back_populates="friendships_2", foreign_keys=[user_id_2])
+
+    def __repr__(self) -> str:
+        return f"<Friendship(user1={self.user_id_1[:8]}, user2={self.user_id_2[:8]})>"

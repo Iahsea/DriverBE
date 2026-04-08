@@ -23,7 +23,7 @@ from app.schemas.room import (
 )
 from app.schemas.message import MessageResponse, MessageListResponse
 from app.core.security import verify_access_token, get_token_from_header
-from app.database.models import User, Room, RoomMember, Message
+from app.database.models import User, Room, RoomMember, Message, Friendship
 from app.database.database import get_db
 from datetime import datetime
 from uuid import UUID
@@ -340,6 +340,21 @@ async def add_member(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User không tìm thấy",
+            )
+        
+        # Kiểm tra xem admin và user cần thêm có phải bạn bè không
+        user_id_1 = min(current_user.id, member_data.user_id)
+        user_id_2 = max(current_user.id, member_data.user_id)
+        
+        friendship = db.query(Friendship).filter(
+            (Friendship.user_id_1 == user_id_1) & 
+            (Friendship.user_id_2 == user_id_2)
+        ).first()
+        
+        if not friendship:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Bạn phải là bạn với user này mới có thể thêm vào group",
             )
         
         # Kiểm tra user đã là member chưa

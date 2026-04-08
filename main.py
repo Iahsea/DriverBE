@@ -25,7 +25,7 @@ import json
 from app.database.database import init_db, SessionLocal
 from app.core.crypto_bridge import crypto_bridge
 from app.core.security import verify_access_token
-from app.api.v1 import auth, rooms
+from app.api.v1 import auth, rooms, friends
 from app.websocket.connection_manager import ConnectionManager
 from app.database.models import User, Room, RoomMember, Message
 
@@ -115,8 +115,15 @@ app.include_router(
     prefix="/api/v1",
 )
 
+# Friends routes: /api/v1/friends/*
+app.include_router(
+    friends.router,
+    prefix="/api/v1",
+)
+
 logger.info("✓ Auth routes registered at /api/v1/auth")
 logger.info("✓ Rooms routes registered at /api/v1/rooms")
+logger.info("✓ Friends routes registered at /api/v1/friends")
 
 # ==================== Health Check Endpoints ====================
 
