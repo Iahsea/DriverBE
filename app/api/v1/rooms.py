@@ -23,8 +23,11 @@ from app.schemas.room import (
 )
 from app.schemas.message import MessageResponse, MessageListResponse
 from app.core.security import verify_access_token, get_token_from_header
+<<<<<<< HEAD
 from app.core.id_utils import normalize_uuid
 from app.core.crypto_bridge import crypto_bridge
+=======
+>>>>>>> eeaf9aec (feat: friends)
 from app.database.models import User, Room, RoomMember, Message, Friendship
 from app.database.database import get_db
 from datetime import datetime
@@ -349,8 +352,13 @@ async def add_member(
             )
         
         # Kiểm tra xem admin và user cần thêm có phải bạn bè không
+<<<<<<< HEAD
         user_id_1 = min(current_user.id, new_user_id)
         user_id_2 = max(current_user.id, new_user_id)
+=======
+        user_id_1 = min(current_user.id, member_data.user_id)
+        user_id_2 = max(current_user.id, member_data.user_id)
+>>>>>>> eeaf9aec (feat: friends)
         
         friendship = db.query(Friendship).filter(
             (Friendship.user_id_1 == user_id_1) & 
