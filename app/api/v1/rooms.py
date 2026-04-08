@@ -47,17 +47,21 @@ def get_current_user(authorization: str = Header(...), db: Session = Depends(get
             )
         
         payload = verify_access_token(token)
-        user_id_str = payload.get("user_id")
-        if not user_id_str:
-            raise ValueError("Invalid token payload")
+        user_id = payload.get("user_id")
+        if not user_id:
+            raise ValueError("Invalid token payload: no user_id")
         
-        user = db.query(User).filter(User.id == user_id_str).first()
+        # Query user by ID (String format)
+        user = db.query(User).filter(User.id == user_id).first()
         if not user:
+            logger.warning(f"User not found: {user_id}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User không tìm thấy",
             )
+        
         return user
+    
     except HTTPException:
         raise
     except Exception as e:

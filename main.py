@@ -13,17 +13,21 @@ Cấu hình chính của FastAPI server bao gồm:
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, status, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, status, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
 import os
 from datetime import datetime, timezone
+import jwt
+import json
 
-from app.database.database import init_db
+from app.database.database import init_db, SessionLocal
 from app.core.crypto_bridge import crypto_bridge
-from app.api.v1 import auth
+from app.core.security import verify_access_token
+from app.api.v1 import auth, rooms
 from app.websocket.connection_manager import ConnectionManager
+from app.database.models import User, Room, RoomMember, Message
 
 # ==================== Logging Configuration ====================
 
@@ -105,7 +109,14 @@ app.include_router(
     prefix="/api/v1",
 )
 
+# Rooms routes: /api/v1/rooms/*
+app.include_router(
+    rooms.router,
+    prefix="/api/v1",
+)
+
 logger.info("✓ Auth routes registered at /api/v1/auth")
+logger.info("✓ Rooms routes registered at /api/v1/rooms")
 
 # ==================== Health Check Endpoints ====================
 
@@ -155,69 +166,183 @@ async def ping():
 
 # ==================== WebSocket Endpoint ====================
 
-# Initialize connection manager
+# Initialize connection manager (per-room)
 connection_manager = ConnectionManager()
 
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
+ALGORITHM = "HS256"
 
-@app.websocket("/ws/chat")
-async def websocket_endpoint(websocket: WebSocket):
+
+@app.websocket("/ws/chat/{room_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Query(...)):
     """
-    WebSocket endpoint cho chat.
+    WebSocket endpoint cho group chat (per-room).
     
     Features:
-    - Quản lý kết nối với ConnectionManager
-    - Broadcast tin nhắn sang tất cả clients
-    - System messages khi client join/leave
+    - Per-room connection management
+    - JWT token authentication
+    - Member verification
+    - Message persistence to database
+    - Per-room broadcasting
     
-    Path: ws://localhost:8000/ws/chat
+    Usage:
+    ws://localhost:8000/ws/chat/{room_id}?token={JWT_TOKEN}
     
     Message format:
     {
-        "type": "message|system",
-        "content": "...",
-        "username": "...",  (optional)
-        "timestamp": "..."  (optional)
+        "content": "message text"
     }
     """
-    await connection_manager.connect(websocket)
     
     try:
-        # Broadcast system message: user joined
-        await connection_manager.broadcast({
-            "type": "system",
-            "content": f"Client joined. Total connections: {connection_manager.get_connection_count()}",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-        
-        logger.info(f"✓ WebSocket client connected. Total: {connection_manager.get_connection_count()}")
-        
-        # Handle incoming messages
-        while True:
-            # Receive message từ client
-            data = await websocket.receive_text()
+        # ===== 1. Verify JWT token =====
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_id = payload.get("user_id")
+            username = payload.get("username")
             
-            # Broadcast message đến tất cả clients
-            await connection_manager.broadcast({
-                "type": "message",
-                "content": data,
+            if not user_id:
+                await websocket.close(code=4001, reason="Invalid token: no user_id")
+                logger.warning(f"WebSocket connection rejected: no user_id in token")
+                return
+        except jwt.ExpiredSignatureError:
+            await websocket.close(code=4002, reason="Token expired")
+            logger.warning(f"WebSocket connection rejected: token expired")
+            return
+        except jwt.InvalidTokenError as e:
+            await websocket.close(code=4003, reason="Invalid token")
+            logger.warning(f"WebSocket connection rejected: invalid token - {e}")
+            return
+        
+        # ===== 2. Verify user exists and room exists =====
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.id == user_id).first()
+            if not user:
+                await websocket.close(code=4004, reason="User not found")
+                logger.warning(f"WebSocket rejected: user {user_id} not found")
+                return
+            
+            room = db.query(Room).filter(Room.id == room_id).first()
+            if not room:
+                await websocket.close(code=4005, reason="Room not found")
+                logger.warning(f"WebSocket rejected: room {room_id} not found")
+                return
+            
+            # ===== 3. Verify user is member of room =====
+            member = db.query(RoomMember).filter(
+                (RoomMember.room_id == room_id) & 
+                (RoomMember.user_id == user_id)
+            ).first()
+            
+            if not member:
+                await websocket.close(code=4006, reason="Not a member of this room")
+                logger.warning(f"WebSocket rejected: user {user_id} is not member of room {room_id}")
+                return
+            
+            # ===== 4. Accept connection =====
+            await connection_manager.connect(room_id, user_id, websocket)
+            logger.info(f"[CONNECT] User {user_id[:8]}... vào room {room_id[:8]}... ({connection_manager.get_room_member_count(room_id)} members)")
+            
+            # ===== 5. Broadcast system message: user joined =====
+            member_count = connection_manager.get_room_member_count(room_id)
+            await connection_manager.broadcast_to_room(room_id, {
+                "type": "system",
+                "content": f"👋 {user.username} đã tham gia phòng",
+                "user_id": user_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
+            
+            logger.info(f"[WS] User {user_id[:8]}... connected to room {room_id[:8]}... ({member_count} members)")
+            
+            # ===== 6. Handle incoming messages =====
+            while True:
+                # Receive message from client
+                data_raw = await websocket.receive_text()
+                
+                try:
+                    data = json.loads(data_raw)
+                    content = data.get("content", "").strip()
+                    
+                    if not content:
+                        continue
+                    
+                    # ===== 7. Save message to database =====
+                    message = Message(
+                        id=None,  # Auto-generate UUID
+                        room_id=room_id,
+                        sender_id=user_id,
+                        content=content,
+                        content_encrypted=None,
+                        created_at=datetime.utcnow(),
+                        updated_at=datetime.utcnow(),
+                    )
+                    
+                    db.add(message)
+                    db.commit()
+                    db.refresh(message)
+                    
+                    # ===== 8. Broadcast message to room members =====
+                    await connection_manager.broadcast_to_room(room_id, {
+                        "type": "message",
+                        "id": message.id,
+                        "room_id": room_id,
+                        "sender_id": user_id,
+                        "sender_name": user.username,
+                        "content": content,
+                        "content_encrypted": message.content_encrypted,
+                        "created_at": message.created_at.isoformat(),
+                        "updated_at": message.updated_at.isoformat(),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    
+                    logger.debug(f"[MSG] {user.username} → room {room_id[:8]}...: {content[:50]}")
+                
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid message format from {user_id}")
+                    continue
+                except Exception as e:
+                    db.rollback()
+                    logger.error(f"Error processing message: {e}")
+                    continue
+        
+        finally:
+            db.close()
     
     except WebSocketDisconnect:
-        connection_manager.disconnect(websocket)
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.id == user_id).first()
+            username = user.username if user else user_id[:8]
+            
+            # Disconnect from connection manager
+            connection_manager.disconnect(room_id, user_id)
+            
+            member_count = connection_manager.get_room_member_count(room_id)
+            
+            # Broadcast system message: user left
+            if member_count > 0:
+                await connection_manager.broadcast_to_room(room_id, {
+                    "type": "system",
+                    "content": f"👋 {username} đã rời phòng",
+                    "user_id": user_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            
+            logger.info(f"[DISCONNECT] User {user_id[:8]}... rời room {room_id[:8]}... ({member_count} members còn lại)")
+            logger.info(f"[WS] User {user_id[:8]}... disconnected from room {room_id[:8]}... ({member_count} members left)")
         
-        # Broadcast system message: user left
-        await connection_manager.broadcast({
-            "type": "system",
-            "content": f"Client disconnected. Total connections: {connection_manager.get_connection_count()}",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-        
-        logger.info(f"WebSocket client disconnected. Total: {connection_manager.get_connection_count()}")
+        except Exception as e:
+            logger.error(f"Error during WebSocket disconnect: {e}")
+        finally:
+            db.close()
     
     except Exception as e:
-        connection_manager.disconnect(websocket)
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error for user {user_id} in room {room_id}: {e}")
+        try:
+            connection_manager.disconnect(room_id, user_id)
+        except:
+            pass
 
 
 # ==================== Error Handlers ====================
