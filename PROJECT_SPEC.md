@@ -28,12 +28,16 @@ secure-chat-system/
 │   │   │   └── v1/
 │   │   │       ├── auth.py   # POST /register, /login, GET /me
 │   │   │       ├── rooms.py  # POST /rooms (create), GET /rooms (list), DELETE /rooms/{id}
-│   │   │       └── messages.py # POST /messages (history), GET /rooms/{id}/messages
+│   │   │       ├── messages.py # POST /messages (history), GET /rooms/{id}/messages
+│   │   │       └── friends.py  # Friend management endpoints (NEW)
 │   │   ├── schemas/          # Pydantic models (DTOs)
 │   │   │   ├── user.py       # UserCreate, UserLogin, UserResponse
 │   │   │   ├── room.py       # RoomCreate, RoomResponse, RoomMemberResponse
-│   │   │   └── message.py    # MessageCreate, MessageResponse
-│   │   └── websocket/        # connection_manager.py (quản lý room subscriptions)
+│   │   │   ├── message.py    # MessageCreate, MessageResponse
+│   │   │   └── friend.py     # FriendRequestCreate, FriendRequestResponse, ... (NEW)
+│   │   └── websocket/        # WebSocket managers
+│   │       ├── connection_manager.py  # Quản lý room subscriptions
+│   │       └── notification_manager.py  # Quản lý notifications real-time (NEW)
 │   ├── database/             # MySQL models (SQLAlchemy)
 │   │   ├── database.py       # Engine, session factory
 │   │   └── models.py         # User, Room, RoomMember, Message ORM models
@@ -225,6 +229,13 @@ CREATE TABLE friendships (
 | POST | `/api/v1/friends/request/{request_id}/cancel` | Hủy lời mời kết bạn (người gửi) |
 | DELETE | `/api/v1/friends/{user_id}` | Xóa bạn/huỷ quan hệ bạn bè |
 
+## 6.2. WebSocket Endpoints - Real-time Notifications (NEW)
+
+| Endpoint | Mô tả | Connection |
+|----------|-------|-----------|
+| WS | `/ws/notifications` | Nhận thông báo real-time (lời mời kết bạn, chấp nhận, từ chối, ...) |
+| WS | `/ws/chat/{room_id}` | Nhận tin nhắn real-time và thông báo group chat |
+
 ## 7. Instructions for the AI & User
 * **AI:** Phải nhớ Backend dùng **Python/FastAPI** và Frontend dùng **React**. Ưu tiên viết code sạch, sử dụng `async/await` cho Backend và Functional Components/Hooks cho Frontend. Group Chat phải quản lý room subscriptions và member permissions.
 * **User:** Đảm bảo cài đặt đầy đủ môi trường (Python 3.10+, Node.js, C++ Build Tools) và chạy Terminal với quyền **Admin** khi test Driver trên Windows. Khi tạo group chat, luôn verify permissions (creator là admin).
@@ -291,11 +302,121 @@ Admin Client → POST /api/v1/rooms/{id}/members → Backend:
   - Broadcast notification: "New member joined"
 ```
 
+## 8.2. Message Flow - Real-time Friendship Notifications (NEW)
+
+### 1. Gửi lời mời kết bạn (với notification):
+```
+Client A → POST /api/v1/friends/request → Backend:
+  - Validate: from_user & to_user không trùng
+  - Check: Chưa là bạn hoặc chưa có pending request
+  - Insert: friend_requests(from=A, to=B, status=pending)
+  - **NEW: Broadcast notification tới User B** (nếu B online ở /ws/notifications):
+    {
+      "type": "friend_request",
+      "from_user_id": "<A_ID>",
+      "from_username": "UserA",
+      "request_id": "abc123...",
+      "message": "UserA muốn kết bạn với bạn",
+      "timestamp": "2026-04-09T10:30:00"
+    }
+  - Trả về: FriendRequestResponse
+```
+
+### 2. Chấp nhận lời mời kết bạn (với notification):
+```
+Client B → POST /api/v1/friends/request/{id}/accept → Backend:
+  - Verify: request.to_user_id == current_user
+  - Update: friend_requests status='accepted'
+  - Insert: friendships(user_id_1, user_id_2) [sorted]
+  - **NEW: Broadcast notification tới User A** (nếu A online ở /ws/notifications):
+    {
+      "type": "friend_request_accepted",
+      "user_id": "<B_ID>",
+      "username": "UserB",
+      "message": "Bạn đã trở thành bạn với UserB",
+      "timestamp": "2026-04-09T10:31:00"
+    }
+  - **NEW: Broadcast notification tới User B** (tự thông báo cho chính mình):
+    {
+      "type": "friend_request_accepted",
+      "user_id": "<A_ID>",
+      "username": "UserA",
+      "message": "Bạn đã trở thành bạn với UserA",
+      "timestamp": "2026-04-09T10:31:00"
+    }
+  - Trả về: FriendshipResponse
+```
+
+### 3. Từ chối lời mời kết bạn (với notification):
+```
+Client B → POST /api/v1/friends/request/{id}/reject → Backend:
+  - Verify: request.to_user_id == current_user
+  - Update: friend_requests status='rejected'
+  - **NEW: Broadcast notification tới User A** (nếu A online ở /ws/notifications):
+    {
+      "type": "friend_request_rejected",
+      "user_id": "<B_ID>",
+      "username": "UserB",
+      "message": "UserB đã từ chối lời mời kết bạn",
+      "timestamp": "2026-04-09T10:32:00"
+    }
+  - Trả về: Success message
+```
+
+### 4. Hủy lời mời kết bạn (với notification):
+```
+Client A → POST /api/v1/friends/request/{id}/cancel → Backend:
+  - Verify: request.from_user_id == current_user
+  - Update: friend_requests status='canceled'
+  - **NEW: Broadcast notification tới User B** (nếu B online ở /ws/notifications):
+    {
+      "type": "friend_request_canceled",
+      "user_id": "<A_ID>",
+      "username": "UserA",
+      "message": "UserA đã hủy lời mời kết bạn",
+      "timestamp": "2026-04-09T10:33:00"
+    }
+  - Trả về: Success message
+```
+
+### 5. Xóa bạn bè (với notification):
+```
+Client A → DELETE /api/v1/friends/{user_b_id} → Backend:
+  - Query: Friendship với user_id_1 = min(A, B) và user_id_2 = max(A, B)
+  - Delete: Friendship record
+  - **NEW: Broadcast notification tới User B** (nếu B online ở /ws/notifications):
+    {
+      "type": "friend_deleted",
+      "user_id": "<A_ID>",
+      "username": "UserA",
+      "message": "UserA đã xóa bạn bè với bạn",
+      "timestamp": "2026-04-09T10:34:00"
+    }
+  - Trả về: Success message
+```
+
+### 6. WebSocket Connection Flow:
+```
+Client → WS /ws/notifications?token=JWT_TOKEN → Backend:
+  - Backend xác thực JWT token
+  - Add user vào online notification connections: {user_id: websocket}
+  - Backend giữ connection sống bằng ping/pong
+  
+  Khi có sự kiện friend:
+    - Backend tìm user_id trong connections
+    - Gửi JSON notification tới user (nếu đang online)
+    - Nếu user offline, notification bị miss (optional: lưu vào DB)
+
+Client disconnect:
+  - Remove user khỏi online connections
+```
+
 ## 9. Current Database Status
 - **Database**: MySQL `secure_chat` @ localhost:3306
 - **User Table**: ✓ Created (id, username, email, password_hash, timestamps)
 - **Room Tables**: ✓ Created (Room, RoomMember, Message models)
 - **Friendship Tables**: ⏳ To be created (friend_requests, friendships)
+- **Notification System**: ✓ In-memory (via WebSocket /ws/notifications, no DB persistence yet)
 - **Encryption**: Fallback mock AES + MD5 via crypto_bridge (real driver pending)
 
 ## 10. Friendship System Rules
@@ -305,9 +426,34 @@ Admin Client → POST /api/v1/rooms/{id}/members → Backend:
 * **Friend List**: User chỉ thấy bạn bè là những người đã accept friend request (status='accepted')
 * **Pending Requests**: Hiển thị riêng lời mời chờ nhận (status='pending')
 
+## 10.1. Real-time Notification System Rules (NEW)
+
+* **Notification Connection:** Mỗi user có thể kết nối tới `/ws/notifications` để nhận thông báo real-time
+* **Notification Types:**
+  - `friend_request`: Nhận khi user khác gửi lời mời kết bạn
+  - `friend_request_accepted`: Nhận khi user khác chấp nhận lời mời của mình
+  - `friend_request_rejected`: Nhận khi user khác từ chối lời mời của mình
+  - `friend_request_canceled`: Nhận khi user khác hủy lời mời gửi tới mình
+  - `friend_deleted`: Nhận khi user khác xóa bạn bè với mình
+* **Real-time Delivery:** Notification chỉ được gửi nếu user đang online (connected tới `/ws/notifications`)
+* **Offline Handling:** Nếu user offline, notification bị miss (optional: lưu vào database để sync sau)
+* **Authentication:** Notification WebSocket yêu cầu JWT token trong query params: `?token=JWT_TOKEN`
+* **Message Format:** JSON đồng nhất với `type`, `user_id`/`from_user_id`, `username`/`from_username`, `message`, `timestamp`
+* **Broadcasting:** Mỗi sự kiện friend action phải broadcast tới tất cả users liên quan (sender + recipient)
+
 ## 11. Fallback & Troubleshooting
 * **Mocking:** Nếu chưa có Driver, AI sẽ cung cấp mã giả lập (Mock) trong `crypto_bridge.py` bằng thư viện `cryptography` của Python để test luồng Socket.
 * **Error Handling:** Luôn xử lý lỗi mất kết nối WebSocket trên React và lỗi Timeout khi gọi xuống Driver từ FastAPI.
 * **Room Permissions**: Kiểm tra user là admin trước khi cho delete room hoặc manage members.
 * **Friendship Validation**: Kiểm tra friendship record trước khi thêm member vào group (chặn non-friends)
 * **Message Encryption**: Hiện tại lưu plaintext + encrypted version; cần migrate tới chỉ encrypted.
+
+## 11.1. Notification System Troubleshooting (NEW)
+* **WebSocket Connection Fails**: Verify JWT token hợp lệ và user tồn tại trước khi accept connection
+* **Lost Notification**: Nếu user disconnect/reconnect, miss notification không được recover (tính năng future)
+* **Offline User Handling**: Backend không cố gắng gửi notification tới offline users, chỉ thử sending nếu connection tồn tại
+* **Duplicate Notifications**: Tránh gửi duplicate bằng cách check connection.active_connections trước send
+* **Memory Leak**: Luôn remove user khỏi notification_manager.active_connections khi disconnect (cleanup trong finally block)
+* **Token Expiration**: Nếu JWT token hết hạn, user phải reconnect với token mới
+* **Concurrent Notifications**: Sử dụng async/await để handle multiple concurrent notification sendings
+* **Database Sync**: Nếu lưu notification vào DB, implement cron job để xóa stale notifications (>7 days)

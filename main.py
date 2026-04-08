@@ -27,6 +27,7 @@ from app.core.crypto_bridge import crypto_bridge
 from app.core.security import verify_access_token
 from app.api.v1 import auth, rooms, friends
 from app.websocket.connection_manager import ConnectionManager
+from app.websocket.notification_manager import notification_manager
 from app.database.models import User, Room, RoomMember, Message
 
 # ==================== Logging Configuration ====================
@@ -350,6 +351,103 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
             connection_manager.disconnect(room_id, user_id)
         except:
             pass
+
+
+# ==================== WebSocket /ws/notifications ====================
+
+@app.websocket("/ws/notifications")
+async def websocket_notifications(websocket: WebSocket):
+    """
+    WebSocket endpoint cho real-time notifications (friend requests, accepted, rejected, ...).
+    
+    Features:
+    - JWT token authentication via query params
+    - Real-time friend notifications
+    - Per-user connection management
+    - Automatic cleanup on disconnect
+    
+    Usage:
+    ws://localhost:8000/ws/notifications?token={JWT_TOKEN}
+    
+    Notification format:
+    {
+        "type": "friend_request|friend_request_accepted|friend_request_rejected|friend_request_canceled|friend_deleted",
+        "from_user_id": "...",
+        "from_username": "...",
+        "user_id": "...",
+        "username": "...",
+        "request_id": "...",
+        "message": "...",
+        "timestamp": "2026-04-09T10:30:00"
+    }
+    """
+    
+    user_id = None
+    
+    try:
+        # ===== 1. Lấy token từ query params =====
+        query_params = dict(
+            param.split("=") for param in websocket.scope.get("query_string", b"").decode().split("&") 
+            if "=" in param
+        )
+        token = query_params.get("token", "").replace("Bearer ", "")
+        
+        if not token:
+            await websocket.close(code=4001, reason="Token required")
+            logger.warning("Notification WebSocket rejected: no token provided")
+            return
+        
+        # ===== 2. Verify JWT token =====
+        try:
+            payload = verify_access_token(token)
+            user_id = payload.get("user_id")
+            
+            if not user_id:
+                await websocket.close(code=4001, reason="Invalid token: no user_id")
+                logger.warning("Notification WebSocket rejected: no user_id in token")
+                return
+        except Exception as e:
+            logger.warning(f"Notification WebSocket rejected: invalid token - {e}")
+            await websocket.close(code=4001, reason="Invalid token")
+            return
+        
+        # ===== 3. Verify user exists =====
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.id == user_id).first()
+            if not user:
+                await websocket.close(code=4004, reason="User not found")
+                logger.warning(f"Notification WebSocket rejected: user {user_id} not found")
+                return
+        finally:
+            db.close()
+        
+        # ===== 4. Connect user tới notification manager =====
+        await notification_manager.connect(user_id, websocket)
+        logger.info(f"✓ Notification WebSocket connected for user {user_id[:8]}...")
+        
+        # ===== 5. Keep connection alive (ping/pong) =====
+        while True:
+            data = await websocket.receive_text()
+            
+            # Handle ping/pong để giữ connection sống
+            if data == "ping":
+                await websocket.send_text("pong")
+            elif data == "pong":
+                # Ignore pong
+                pass
+            else:
+                logger.debug(f"Received from {user_id[:8]}...: {data}")
+    
+    except WebSocketDisconnect:
+        if user_id:
+            notification_manager.disconnect(user_id)
+            logger.info(f"✓ Notification WebSocket disconnected for user {user_id[:8]}...")
+    
+    except Exception as e:
+        logger.error(f"Notification WebSocket error for user {user_id}: {e}")
+        if user_id:
+            notification_manager.disconnect(user_id)
 
 
 # ==================== Error Handlers ====================
