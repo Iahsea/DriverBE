@@ -1,0 +1,275 @@
+{
+  "info": {
+    "name": "Secure Chat API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://127.0.0.1:8000" },
+    { "key": "token", "value": "" },
+    { "key": "user_id", "value": "" },
+    { "key": "friend_id", "value": "" },
+    { "key": "room_id", "value": "" },
+    { "key": "request_id", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Root",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/"
+          }
+        },
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health"
+          }
+        },
+        {
+          "name": "Ping",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/v1/ping"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"user_a\",\n  \"email\": \"user_a@example.com\",\n  \"password\": \"SecurePass123!\"\n}"
+            },
+            "url": "{{base_url}}/api/v1/auth/register"
+          }
+        },
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"user_a\",\n  \"password\": \"SecurePass123!\"\n}"
+            },
+            "url": "{{base_url}}/api/v1/auth/login"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var data = pm.response.json();",
+                  "if (data && data.access_token) { pm.collectionVariables.set('token', data.access_token); }",
+                  "if (data && data.user && data.user.id) { pm.collectionVariables.set('user_id', data.user.id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Me",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/v1/auth/me"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Friends",
+      "item": [
+        {
+          "name": "List Friends",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/v1/friends"
+          }
+        },
+        {
+          "name": "List Friend Requests",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/v1/friends/requests"
+          }
+        },
+        {
+          "name": "Send Friend Request",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to_user_id\": \"{{friend_id}}\"\n}"
+            },
+            "url": "{{base_url}}/api/v1/friends/request"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var data = pm.response.json();",
+                  "if (data && data.id) { pm.collectionVariables.set('request_id', data.id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Accept Friend Request",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/v1/friends/request/{{request_id}}/accept"
+          }
+        },
+        {
+          "name": "Reject Friend Request",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/v1/friends/request/{{request_id}}/reject"
+          }
+        },
+        {
+          "name": "Cancel Friend Request",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/v1/friends/request/{{request_id}}/cancel"
+          }
+        },
+        {
+          "name": "Delete Friend",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/v1/friends/{{friend_id}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Rooms",
+      "item": [
+        {
+          "name": "List Rooms",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/v1/rooms"
+          }
+        },
+        {
+          "name": "Create Room",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Test Room\",\n  \"description\": \"Postman room\",\n  \"is_group\": true\n}"
+            },
+            "url": "{{base_url}}/api/v1/rooms"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var data = pm.response.json();",
+                  "if (data && data.id) { pm.collectionVariables.set('room_id', data.id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Room",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/v1/rooms/{{room_id}}"
+          }
+        },
+        {
+          "name": "Add Room Member",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{friend_id}}\",\n  \"role\": \"member\"\n}"
+            },
+            "url": "{{base_url}}/api/v1/rooms/{{room_id}}/members"
+          }
+        },
+        {
+          "name": "Remove Room Member",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/v1/rooms/{{room_id}}/members/{{friend_id}}"
+          }
+        },
+        {
+          "name": "Get Room Messages",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/v1/rooms/{{room_id}}/messages?skip=0&limit=50"
+          }
+        },
+        {
+          "name": "Delete Room",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{base_url}}/api/v1/rooms/{{room_id}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "WebSocket",
+      "item": [
+        {
+          "name": "Chat Socket",
+          "request": {
+            "method": "GET",
+            "url": "ws://127.0.0.1:8000/ws/chat/{{room_id}}?token={{token}}"
+          }
+        },
+        {
+          "name": "Notifications Socket",
+          "request": {
+            "method": "GET",
+            "url": "ws://127.0.0.1:8000/ws/notifications?token={{token}}"
+          }
+        }
+      ]
+    }
+  ]
+}

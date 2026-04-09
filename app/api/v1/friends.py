@@ -22,6 +22,7 @@ from app.schemas.friend import (
     FriendListResponse,
 )
 from app.core.security import verify_access_token, get_token_from_header
+from app.core.id_utils import normalize_uuid
 from app.database.models import User, FriendRequest, Friendship
 from app.database.database import get_db
 from app.websocket.notification_manager import notification_manager
@@ -49,6 +50,7 @@ def get_current_user(authorization: str = Header(...), db: Session = Depends(get
         user_id = payload.get("user_id")
         if not user_id:
             raise ValueError("Invalid token payload: no user_id")
+        user_id = normalize_uuid(user_id)
         
         # Query user by ID (String format)
         user = db.query(User).filter(User.id == user_id).first()
@@ -196,14 +198,15 @@ async def send_friend_request(
     """
     try:
         # Kiểm tra to_user != current_user
-        if request_data.to_user_id == current_user.id:
+        if normalize_uuid(request_data.to_user_id) == current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Không thể gửi lời mời cho chính mình",
             )
         
         # Kiểm tra to_user tồn tại
-        to_user = db.query(User).filter(User.id == request_data.to_user_id).first()
+        to_user_id = normalize_uuid(request_data.to_user_id)
+        to_user = db.query(User).filter(User.id == to_user_id).first()
         if not to_user:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -211,8 +214,8 @@ async def send_friend_request(
             )
         
         # Kiểm tra đã là bạn chưa
-        user_id_1 = min(current_user.id, request_data.to_user_id)
-        user_id_2 = max(current_user.id, request_data.to_user_id)
+        user_id_1 = min(current_user.id, to_user_id)
+        user_id_2 = max(current_user.id, to_user_id)
         
         existing_friendship = db.query(Friendship).filter(
             and_(
@@ -232,11 +235,11 @@ async def send_friend_request(
             or_(
                 and_(
                     FriendRequest.from_user_id == current_user.id,
-                    FriendRequest.to_user_id == request_data.to_user_id,
+                    FriendRequest.to_user_id == to_user_id,
                     FriendRequest.status == "pending",
                 ),
                 and_(
-                    FriendRequest.from_user_id == request_data.to_user_id,
+                    FriendRequest.from_user_id == to_user_id,
                     FriendRequest.to_user_id == current_user.id,
                     FriendRequest.status == "pending",
                 ),
@@ -252,7 +255,7 @@ async def send_friend_request(
         # Tạo friend request mới
         new_request = FriendRequest(
             from_user_id=current_user.id,
-            to_user_id=request_data.to_user_id,
+            to_user_id=to_user_id,
             status="pending",
         )
         
@@ -320,7 +323,8 @@ async def accept_friend_request(
     """
     try:
         # Tìm request
-        friend_request = db.query(FriendRequest).filter(FriendRequest.id == request_id).first()
+        friend_request_id = normalize_uuid(request_id)
+        friend_request = db.query(FriendRequest).filter(FriendRequest.id == friend_request_id).first()
         if not friend_request:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -430,7 +434,8 @@ async def reject_friend_request(
     """
     try:
         # Tìm request
-        friend_request = db.query(FriendRequest).filter(FriendRequest.id == request_id).first()
+        friend_request_id = normalize_uuid(request_id)
+        friend_request = db.query(FriendRequest).filter(FriendRequest.id == friend_request_id).first()
         if not friend_request:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -516,7 +521,8 @@ async def cancel_friend_request(
     """
     try:
         # Tìm request
-        friend_request = db.query(FriendRequest).filter(FriendRequest.id == request_id).first()
+        friend_request_id = normalize_uuid(request_id)
+        friend_request = db.query(FriendRequest).filter(FriendRequest.id == friend_request_id).first()
         if not friend_request:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -599,14 +605,15 @@ async def delete_friend(
     """
     try:
         # Kiểm tra user_id != current_user.id
-        if user_id == current_user.id:
+        if normalize_uuid(user_id) == current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Không thể xóa chính mình",
             )
         
         # Kiểm tra user tồn tại
-        friend_user = db.query(User).filter(User.id == user_id).first()
+        friend_user_id = normalize_uuid(user_id)
+        friend_user = db.query(User).filter(User.id == friend_user_id).first()
         if not friend_user:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -614,8 +621,8 @@ async def delete_friend(
             )
         
         # Tìm friendship (user_id_1 < user_id_2)
-        user_id_1 = min(current_user.id, user_id)
-        user_id_2 = max(current_user.id, user_id)
+        user_id_1 = min(current_user.id, friend_user_id)
+        user_id_2 = max(current_user.id, friend_user_id)
         
         friendship = db.query(Friendship).filter(
             and_(

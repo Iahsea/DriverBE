@@ -25,6 +25,7 @@ import json
 from app.database.database import init_db, SessionLocal
 from app.core.crypto_bridge import crypto_bridge
 from app.core.security import verify_access_token
+from app.core.id_utils import normalize_uuid
 from app.api.v1 import auth, rooms, friends
 from app.websocket.connection_manager import ConnectionManager
 from app.websocket.notification_manager import notification_manager
@@ -225,13 +226,15 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
         # ===== 2. Verify user exists and room exists =====
         db = SessionLocal()
         try:
-            user = db.query(User).filter(User.id == user_id).first()
+            user_id_norm = normalize_uuid(user_id)
+            user = db.query(User).filter(User.id == user_id_norm).first()
             if not user:
                 await websocket.close(code=4004, reason="User not found")
                 logger.warning(f"WebSocket rejected: user {user_id} not found")
                 return
             
-            room = db.query(Room).filter(Room.id == room_id).first()
+            room_id_norm = normalize_uuid(room_id)
+            room = db.query(Room).filter(Room.id == room_id_norm).first()
             if not room:
                 await websocket.close(code=4005, reason="Room not found")
                 logger.warning(f"WebSocket rejected: room {room_id} not found")
@@ -239,8 +242,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
             
             # ===== 3. Verify user is member of room =====
             member = db.query(RoomMember).filter(
-                (RoomMember.room_id == room_id) & 
-                (RoomMember.user_id == user_id)
+                (RoomMember.room_id == room_id_norm) & 
+                (RoomMember.user_id == user_id_norm)
             ).first()
             
             if not member:
@@ -249,15 +252,15 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                 return
             
             # ===== 4. Accept connection =====
-            await connection_manager.connect(room_id, user_id, websocket)
-            logger.info(f"[CONNECT] User {user_id[:8]}... vào room {room_id[:8]}... ({connection_manager.get_room_member_count(room_id)} members)")
+            await connection_manager.connect(room_id_norm, user_id_norm, websocket)
+            logger.info(f"[CONNECT] User {user_id_norm[:8]}... vào room {room_id_norm[:8]}... ({connection_manager.get_room_member_count(room_id_norm)} members)")
             
             # ===== 5. Broadcast system message: user joined =====
-            member_count = connection_manager.get_room_member_count(room_id)
-            await connection_manager.broadcast_to_room(room_id, {
+            member_count = connection_manager.get_room_member_count(room_id_norm)
+            await connection_manager.broadcast_to_room(room_id_norm, {
                 "type": "system",
                 "content": f"👋 {user.username} đã tham gia phòng",
-                "user_id": user_id,
+                "user_id": user_id_norm,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
             
@@ -271,17 +274,47 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                 try:
                     data = json.loads(data_raw)
                     content = data.get("content", "").strip()
+                    content_encrypted = data.get("content_encrypted", "").strip()
                     
-                    if not content:
+                    if not content and not content_encrypted:
                         continue
+
+                    if content_encrypted:
+                        try:
+                            content = await crypto_bridge.decrypt_message_payload(content_encrypted)
+                        except Exception as e:
+                            logger.error(f"Decrypt incoming message failed: {e}")
+                            await connection_manager.send_personal_message(
+                                room_id_norm,
+                                user_id_norm,
+                                {
+                                    "type": "error",
+                                    "content": "Decrypt failed on server",
+                                },
+                            )
+                            continue
+                    else:
+                        try:
+                            content_encrypted = await crypto_bridge.encrypt_message_payload(content)
+                        except Exception as e:
+                            logger.error(f"Encrypt outgoing message failed: {e}")
+                            await connection_manager.send_personal_message(
+                                room_id_norm,
+                                user_id_norm,
+                                {
+                                    "type": "error",
+                                    "content": "Encrypt failed on server",
+                                },
+                            )
+                            continue
                     
                     # ===== 7. Save message to database =====
                     message = Message(
                         id=None,  # Auto-generate UUID
-                        room_id=room_id,
-                        sender_id=user_id,
+                        room_id=room_id_norm,
+                        sender_id=user_id_norm,
                         content=content,
-                        content_encrypted=None,
+                        content_encrypted=content_encrypted,
                         created_at=datetime.utcnow(),
                         updated_at=datetime.utcnow(),
                     )
@@ -291,11 +324,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     db.refresh(message)
                     
                     # ===== 8. Broadcast message to room members =====
-                    await connection_manager.broadcast_to_room(room_id, {
+                    await connection_manager.broadcast_to_room(room_id_norm, {
                         "type": "message",
                         "id": message.id,
-                        "room_id": room_id,
-                        "sender_id": user_id,
+                        "room_id": room_id_norm,
+                        "sender_id": user_id_norm,
                         "sender_name": user.username,
                         "content": content,
                         "content_encrypted": message.content_encrypted,
@@ -304,7 +337,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
                     
-                    logger.debug(f"[MSG] {user.username} → room {room_id[:8]}...: {content[:50]}")
+                    logger.debug(f"[MSG] {user.username} → room {room_id_norm[:8]}...: {content[:50]}")
                 
                 except json.JSONDecodeError:
                     logger.warning(f"Invalid message format from {user_id}")
@@ -320,25 +353,27 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
     except WebSocketDisconnect:
         db = SessionLocal()
         try:
-            user = db.query(User).filter(User.id == user_id).first()
-            username = user.username if user else user_id[:8]
+            user_id_norm = normalize_uuid(user_id) if user_id else None
+            user = db.query(User).filter(User.id == user_id_norm).first() if user_id_norm else None
+            username = user.username if user else (user_id_norm[:8] if user_id_norm else "unknown")
             
             # Disconnect from connection manager
-            connection_manager.disconnect(room_id, user_id)
+            room_id_norm = normalize_uuid(room_id)
+            connection_manager.disconnect(room_id_norm, user_id_norm)
             
-            member_count = connection_manager.get_room_member_count(room_id)
+            member_count = connection_manager.get_room_member_count(room_id_norm)
             
             # Broadcast system message: user left
             if member_count > 0:
-                await connection_manager.broadcast_to_room(room_id, {
+                await connection_manager.broadcast_to_room(room_id_norm, {
                     "type": "system",
                     "content": f"👋 {username} đã rời phòng",
-                    "user_id": user_id,
+                    "user_id": user_id_norm,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
             
-            logger.info(f"[DISCONNECT] User {user_id[:8]}... rời room {room_id[:8]}... ({member_count} members còn lại)")
-            logger.info(f"[WS] User {user_id[:8]}... disconnected from room {room_id[:8]}... ({member_count} members left)")
+            logger.info(f"[DISCONNECT] User {user_id_norm[:8]}... rời room {room_id_norm[:8]}... ({member_count} members còn lại)")
+            logger.info(f"[WS] User {user_id_norm[:8]}... disconnected from room {room_id_norm[:8]}... ({member_count} members left)")
         
         except Exception as e:
             logger.error(f"Error during WebSocket disconnect: {e}")
@@ -348,7 +383,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
     except Exception as e:
         logger.error(f"WebSocket error for user {user_id} in room {room_id}: {e}")
         try:
-            connection_manager.disconnect(room_id, user_id)
+            if user_id and room_id:
+                connection_manager.disconnect(normalize_uuid(room_id), normalize_uuid(user_id))
         except:
             pass
 
@@ -414,7 +450,8 @@ async def websocket_notifications(websocket: WebSocket):
         # ===== 3. Verify user exists =====
         db = SessionLocal()
         try:
-            user = db.query(User).filter(User.id == user_id).first()
+            user_id_norm = normalize_uuid(user_id)
+            user = db.query(User).filter(User.id == user_id_norm).first()
             if not user:
                 await websocket.close(code=4004, reason="User not found")
                 logger.warning(f"Notification WebSocket rejected: user {user_id} not found")
@@ -423,8 +460,8 @@ async def websocket_notifications(websocket: WebSocket):
             db.close()
         
         # ===== 4. Connect user tới notification manager =====
-        await notification_manager.connect(user_id, websocket)
-        logger.info(f"✓ Notification WebSocket connected for user {user_id[:8]}...")
+        await notification_manager.connect(user_id_norm, websocket)
+        logger.info(f"✓ Notification WebSocket connected for user {user_id_norm[:8]}...")
         
         # ===== 5. Keep connection alive (ping/pong) =====
         while True:
@@ -441,13 +478,14 @@ async def websocket_notifications(websocket: WebSocket):
     
     except WebSocketDisconnect:
         if user_id:
-            notification_manager.disconnect(user_id)
-            logger.info(f"✓ Notification WebSocket disconnected for user {user_id[:8]}...")
+            user_id_norm = normalize_uuid(user_id)
+            notification_manager.disconnect(user_id_norm)
+            logger.info(f"✓ Notification WebSocket disconnected for user {user_id_norm[:8]}...")
     
     except Exception as e:
         logger.error(f"Notification WebSocket error for user {user_id}: {e}")
         if user_id:
-            notification_manager.disconnect(user_id)
+            notification_manager.disconnect(normalize_uuid(user_id))
 
 
 # ==================== Error Handlers ====================

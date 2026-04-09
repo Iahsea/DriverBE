@@ -23,10 +23,11 @@ from app.schemas.room import (
 )
 from app.schemas.message import MessageResponse, MessageListResponse
 from app.core.security import verify_access_token, get_token_from_header
+from app.core.id_utils import normalize_uuid
+from app.core.crypto_bridge import crypto_bridge
 from app.database.models import User, Room, RoomMember, Message, Friendship
 from app.database.database import get_db
 from datetime import datetime
-from uuid import UUID
 import logging
 
 router = APIRouter(prefix="/rooms", tags=["Rooms"])
@@ -50,6 +51,7 @@ def get_current_user(authorization: str = Header(...), db: Session = Depends(get
         user_id = payload.get("user_id")
         if not user_id:
             raise ValueError("Invalid token payload: no user_id")
+        user_id = normalize_uuid(user_id)
         
         # Query user by ID (String format)
         user = db.query(User).filter(User.id == user_id).first()
@@ -192,7 +194,8 @@ async def get_room(
     """
     try:
         # Kiểm tra room tồn tại
-        room = db.query(Room).filter(Room.id == room_id).first()
+        room_id_norm = normalize_uuid(room_id)
+        room = db.query(Room).filter(Room.id == room_id_norm).first()
         if not room:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -201,7 +204,7 @@ async def get_room(
         
         # Kiểm tra user là member
         member = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
+            (RoomMember.room_id == room_id_norm) & 
             (RoomMember.user_id == current_user.id)
         ).first()
         
@@ -261,7 +264,8 @@ async def delete_room(
     Xóa phòng. Chỉ admin mới có thể xóa.
     """
     try:
-        room = db.query(Room).filter(Room.id == room_id).first()
+        room_id_norm = normalize_uuid(room_id)
+        room = db.query(Room).filter(Room.id == room_id_norm).first()
         if not room:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -270,7 +274,7 @@ async def delete_room(
         
         # Kiểm tra user là admin
         member = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
+            (RoomMember.room_id == room_id_norm) & 
             (RoomMember.user_id == current_user.id)
         ).first()
         
@@ -315,7 +319,8 @@ async def add_member(
     """
     try:
         # Kiểm tra room tồn tại
-        room = db.query(Room).filter(Room.id == room_id).first()
+        room_id_norm = normalize_uuid(room_id)
+        room = db.query(Room).filter(Room.id == room_id_norm).first()
         if not room:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -324,7 +329,7 @@ async def add_member(
         
         # Kiểm tra current user là admin/moderator
         current_member = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
+            (RoomMember.room_id == room_id_norm) & 
             (RoomMember.user_id == current_user.id)
         ).first()
         
@@ -335,7 +340,8 @@ async def add_member(
             )
         
         # Kiểm tra user cần thêm tồn tại
-        new_user = db.query(User).filter(User.id == member_data.user_id).first()
+        new_user_id = normalize_uuid(member_data.user_id)
+        new_user = db.query(User).filter(User.id == new_user_id).first()
         if not new_user:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -343,8 +349,8 @@ async def add_member(
             )
         
         # Kiểm tra xem admin và user cần thêm có phải bạn bè không
-        user_id_1 = min(current_user.id, member_data.user_id)
-        user_id_2 = max(current_user.id, member_data.user_id)
+        user_id_1 = min(current_user.id, new_user_id)
+        user_id_2 = max(current_user.id, new_user_id)
         
         friendship = db.query(Friendship).filter(
             (Friendship.user_id_1 == user_id_1) & 
@@ -359,8 +365,8 @@ async def add_member(
         
         # Kiểm tra user đã là member chưa
         existing = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
-            (RoomMember.user_id == member_data.user_id)
+            (RoomMember.room_id == room_id_norm) & 
+            (RoomMember.user_id == new_user_id)
         ).first()
         
         if existing:
@@ -371,8 +377,8 @@ async def add_member(
         
         # Thêm member mới
         new_member = RoomMember(
-            room_id=room_id,
-            user_id=member_data.user_id,
+            room_id=room_id_norm,
+            user_id=new_user_id,
             role=member_data.role,
         )
         
@@ -419,7 +425,8 @@ async def remove_member(
     Xóa user khỏi phòng. Admin/moderator mới có thể xóa.
     """
     try:
-        room = db.query(Room).filter(Room.id == room_id).first()
+        room_id_norm = normalize_uuid(room_id)
+        room = db.query(Room).filter(Room.id == room_id_norm).first()
         if not room:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -428,7 +435,7 @@ async def remove_member(
         
         # Kiểm tra current user là admin/moderator
         current_member = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
+            (RoomMember.room_id == room_id_norm) & 
             (RoomMember.user_id == current_user.id)
         ).first()
         
@@ -439,9 +446,10 @@ async def remove_member(
             )
         
         # Tìm member cần xóa
+        user_id_norm = normalize_uuid(user_id)
         member = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
-            (RoomMember.user_id == user_id)
+            (RoomMember.room_id == room_id_norm) & 
+            (RoomMember.user_id == user_id_norm)
         ).first()
         
         if not member:
@@ -487,8 +495,9 @@ async def get_messages(
     """
     try:
         # Kiểm tra user là member
+        room_id_norm = normalize_uuid(room_id)
         member = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
+            (RoomMember.room_id == room_id_norm) & 
             (RoomMember.user_id == current_user.id)
         ).first()
         
@@ -499,19 +508,26 @@ async def get_messages(
             )
         
         # Lấy tin nhắn
-        total = db.query(Message).filter(Message.room_id == room_id).count()
+        total = db.query(Message).filter(Message.room_id == room_id_norm).count()
         messages_db = db.query(Message).filter(
-            Message.room_id == room_id
+            Message.room_id == room_id_norm
         ).order_by(desc(Message.created_at)).offset(skip).limit(limit).all()
         
         messages = []
         for msg in messages_db:
+            content = msg.content
+            if msg.content_encrypted:
+                try:
+                    content = await crypto_bridge.decrypt_message_payload(msg.content_encrypted)
+                except Exception as e:
+                    logger.warning(f"Failed to decrypt message {msg.id}: {e}")
+
             messages.append(MessageResponse(
                 id=msg.id,
                 room_id=msg.room_id,
                 sender_id=msg.sender_id,
                 sender_name=msg.sender.username,
-                content=msg.content,
+                content=content,
                 content_encrypted=msg.content_encrypted,
                 created_at=msg.created_at,
                 updated_at=msg.updated_at,

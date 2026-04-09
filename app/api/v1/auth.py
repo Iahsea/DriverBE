@@ -19,10 +19,10 @@ from app.schemas.user import (
 )
 from app.core.crypto_bridge import crypto_bridge
 from app.core.security import create_access_token, verify_access_token, get_token_from_header
+from app.core.id_utils import normalize_uuid
 from app.database.models import User
 from app.database.database import get_db
 from datetime import datetime
-from uuid import UUID
 import logging
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -310,12 +310,7 @@ async def get_current_user(
             user_id_str = payload.get("user_id")
             if not user_id_str:
                 raise ValueError("Invalid token payload")
-            
-            # Convert string UUID to UUID object
-            try:
-                user_id = UUID(user_id_str)
-            except (ValueError, TypeError):
-                raise ValueError("Invalid user_id format in token")
+            user_id = normalize_uuid(user_id_str)
         except HTTPException:
             raise
         except Exception as e:

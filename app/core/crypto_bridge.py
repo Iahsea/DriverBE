@@ -7,6 +7,7 @@ Cây cầu giao tiếp giữa Python (User-mode) và Kernel Driver.
 - Async wrapper để tránh tắc nghẽn event loop
 """
 
+import base64
 import ctypes
 import hashlib
 import logging
@@ -338,6 +339,60 @@ class CryptoBridge:
             iv,
         )
 
+    @staticmethod
+    def _pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
+        pad_len = block_size - (len(data) % block_size)
+        return data + bytes([pad_len]) * pad_len
+
+    @staticmethod
+    def _pkcs7_unpad(data: bytes, block_size: int = 16) -> bytes:
+        if not data or (len(data) % block_size) != 0:
+            raise ValueError("Invalid padded data length")
+        pad_len = data[-1]
+        if pad_len < 1 or pad_len > block_size:
+            raise ValueError("Invalid padding length")
+        if data[-pad_len:] != bytes([pad_len]) * pad_len:
+            raise ValueError("Invalid padding bytes")
+        return data[:-pad_len]
+
+    @staticmethod
+    def _get_aes_key_from_env() -> bytes:
+        key_hex = os.getenv("AES_KEY_HEX")
+        if not key_hex:
+            raise RuntimeError("AES_KEY_HEX is not set")
+        if len(key_hex) != 64:
+            raise ValueError("AES_KEY_HEX must be 64 hex chars (32 bytes)")
+        try:
+            return bytes.fromhex(key_hex)
+        except ValueError as e:
+            raise ValueError("AES_KEY_HEX contains non-hex characters") from e
+
+    async def encrypt_message_payload(self, plaintext: str) -> str:
+        key = self._get_aes_key_from_env()
+        iv = os.urandom(16)
+        padded = self._pkcs7_pad(plaintext.encode("utf-8"))
+        if len(padded) > 512:
+            raise ValueError("Message too long after padding (max 512 bytes)")
+        ciphertext = await self.encrypt_aes_with_driver(padded, key, iv)
+        payload = iv + ciphertext
+        return base64.b64encode(payload).decode("ascii")
+
+    async def decrypt_message_payload(self, payload_b64: str) -> str:
+        key = self._get_aes_key_from_env()
+        try:
+            payload = base64.b64decode(payload_b64.encode("ascii"), validate=True)
+        except Exception as e:
+            raise ValueError("Invalid base64 payload") from e
+        if len(payload) < 16:
+            raise ValueError("Invalid payload length")
+        iv = payload[:16]
+        ciphertext = payload[16:]
+        if len(ciphertext) % 16 != 0:
+            raise ValueError("Invalid ciphertext length")
+        plaintext_padded = await self.decrypt_aes_with_driver(ciphertext, key, iv)
+        plaintext = self._pkcs7_unpad(plaintext_padded)
+        return plaintext.decode("utf-8")
+
     # ==================== Driver Implementation ====================
 
     def _hash_via_driver(self, password_bytes: bytes) -> str:
@@ -411,8 +466,11 @@ class CryptoBridge:
             # Gọi ioctl
             logger.debug(f"[Linux] Calling ioctl IOCTL_HASH_MD5 for {len(password_bytes)} bytes")
             
-            with open(self.device_path, "rb+") as f:
-                fcntl.ioctl(f, IOCTLOperation.IOCTL_HASH_MD5, buffer)
+            fd = os.open(self.device_path, os.O_RDWR)
+            try:
+                fcntl.ioctl(fd, IOCTLOperation.IOCTL_HASH_MD5, buffer)
+            finally:
+                os.close(fd)
             
             hash_bytes = bytes(buffer.hash)
             logger.debug(f"[Linux] Hash result: {hash_bytes.hex()}")
@@ -512,8 +570,11 @@ class CryptoBridge:
             
             logger.debug(f"[Linux] Calling ioctl IOCTL_ENCRYPT_AES for {len(plaintext)} bytes")
             
-            with open(self.device_path, "rb+") as f:
-                fcntl.ioctl(f, IOCTLOperation.IOCTL_ENCRYPT_AES, buffer)
+            fd = os.open(self.device_path, os.O_RDWR)
+            try:
+                fcntl.ioctl(fd, IOCTLOperation.IOCTL_ENCRYPT_AES, buffer)
+            finally:
+                os.close(fd)
             
             logger.debug(f"[Linux] Encryption successful")
             return bytes(buffer.output[:buffer.dataLen])
@@ -612,8 +673,11 @@ class CryptoBridge:
             
             logger.debug(f"[Linux] Calling ioctl IOCTL_DECRYPT_AES for {len(ciphertext)} bytes")
             
-            with open(self.device_path, "rb+") as f:
-                fcntl.ioctl(f, IOCTLOperation.IOCTL_DECRYPT_AES, buffer)
+            fd = os.open(self.device_path, os.O_RDWR)
+            try:
+                fcntl.ioctl(fd, IOCTLOperation.IOCTL_DECRYPT_AES, buffer)
+            finally:
+                os.close(fd)
             
             logger.debug(f"[Linux] Decryption successful")
             return bytes(buffer.output[:buffer.dataLen])
@@ -649,6 +713,8 @@ class CryptoBridge:
             
             if len(key) != 32 or len(iv) != 16:
                 raise ValueError("Key must be 32 bytes, IV must be 16 bytes")
+            if len(plaintext) % 16 != 0:
+                raise ValueError("Plaintext length must be a multiple of 16 bytes")
             
             cipher = Cipher(
                 algorithms.AES(key),
@@ -656,13 +722,7 @@ class CryptoBridge:
                 backend=default_backend(),
             )
             encryptor = cipher.encryptor()
-            
-            # Add PKCS7 padding
-            from cryptography.hazmat.primitives import padding
-            padder = padding.PKCS7(128).padder()
-            padded_data = padder.update(plaintext) + padder.finalize()
-            
-            return encryptor.update(padded_data) + encryptor.finalize()
+            return encryptor.update(plaintext) + encryptor.finalize()
         except ImportError:
             raise RuntimeError("cryptography library not installed")
 
@@ -677,6 +737,8 @@ class CryptoBridge:
             
             if len(key) != 32 or len(iv) != 16:
                 raise ValueError("Key must be 32 bytes, IV must be 16 bytes")
+            if len(ciphertext) % 16 != 0:
+                raise ValueError("Ciphertext length must be a multiple of 16 bytes")
             
             cipher = Cipher(
                 algorithms.AES(key),
@@ -684,14 +746,7 @@ class CryptoBridge:
                 backend=default_backend(),
             )
             decryptor = cipher.decryptor()
-            
-            padded_data = decryptor.update(ciphertext) + decryptor.finalize()
-            
-            # Remove PKCS7 padding
-            from cryptography.hazmat.primitives import padding
-            unpadder = padding.PKCS7(128).unpadder()
-            
-            return unpadder.update(padded_data) + unpadder.finalize()
+            return decryptor.update(ciphertext) + decryptor.finalize()
         except ImportError:
             raise RuntimeError("cryptography library not installed")
 
