@@ -240,6 +240,7 @@ class CryptoBridge:
         
         if self.driver_available:
             try:
+
                 password_bytes = password.encode("utf-8")
                 hash_result = await loop.run_in_executor(
                     self.executor,

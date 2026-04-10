@@ -18,4 +18,8 @@ async function getMe() {
   return request('/api/v1/auth/me')
 }
 
-export { login, register, getMe }
+async function getUser(userId) {
+  return request(`/api/v1/auth/users/${userId}`)
+}
+
+export { login, register, getMe, getUser }

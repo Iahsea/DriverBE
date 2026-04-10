@@ -1,63 +1,125 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import AppShell from './components/AppShell.jsx'
-import AuthPage from './pages/AuthPage.jsx'
-import ChatPage from './pages/ChatPage.jsx'
-import FriendsPage from './pages/FriendsPage.jsx'
-import SettingsPage from './pages/SettingsPage.jsx'
-import { useAuth } from './store/auth.jsx'
+import { BrowserRouter as Router, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
+import { useState } from 'react'
+import { Layout, Button, Menu, Avatar, Dropdown } from 'antd'
+import {
+  MessageOutlined,
+  TeamOutlined,
+  SettingOutlined,
+  LogoutOutlined,
+  BellOutlined,
+} from '@ant-design/icons'
+import AuthPage from './pages/AuthPage'
+import ChatPage from './pages/ChatPage'
+import FriendsPage from './pages/FriendsPage'
+import ProfilePage from './pages/ProfilePage'
+import { useAuth } from './store/auth'
 import './App.css'
 
-function RequireAuth({ children }) {
-  const { token, loading } = useAuth()
-  if (loading) {
-    return <div className="page-loading">Loading...</div>
+function AppShell({ children }) {
+  const { user, logout } = useAuth()
+  const [collapsed, setCollapsed] = useState(false)
+  const navigate = useNavigate()
+  const location = useLocation()
+
+  const menuItems = [
+    {
+      key: '/chat',
+      icon: <MessageOutlined />,
+      label: 'Chat',
+    },
+    {
+      key: '/friends',
+      icon: <TeamOutlined />,
+      label: 'Friends',
+    },
+    {
+      key: '/settings',
+      icon: <SettingOutlined />,
+      label: 'Settings',
+    },
+  ]
+
+  const userMenu = {
+    items: [
+      {
+        key: 'profile',
+        icon: <MessageOutlined />,
+        label: 'View Profile',
+        onClick: () => navigate(`/profile/${user?.id}`),
+      },
+      {
+        key: 'logout',
+        icon: <LogoutOutlined />,
+        label: 'Logout',
+        onClick: logout,
+      },
+    ],
   }
-  if (!token) {
-    return <Navigate to="/auth" replace />
-  }
-  return children
+
+  return (
+    <Layout style={{ minHeight: '100vh' }}>
+      <Layout.Sider trigger={null} collapsible collapsed={collapsed} width={240}>
+        <div className="logo">
+          <h2 style={{ color: '#ffffff', margin: 0 }}>SecureChat</h2>
+        </div>
+        <Menu
+          theme="dark"
+          items={menuItems}
+          selectedKeys={[location.pathname]}
+          onClick={({ key }) => navigate(key)}
+        />
+      </Layout.Sider>
+
+      <Layout>
+        <div className="app-header">
+          <div className="header-left">
+            <Button
+              type="text"
+              onClick={() => setCollapsed(!collapsed)}
+              style={{ color: '#65676b', fontSize: 18 }}
+            >
+              ☰
+            </Button>
+          </div>
+
+          <div className="header-right">
+            <Button type="text" icon={<BellOutlined />} />
+            <Dropdown menu={userMenu} trigger={['click']}>
+              <Avatar style={{ backgroundColor: '#1890ff', cursor: 'pointer' }}>
+                {user?.username?.slice(0, 1).toUpperCase() || 'U'}
+              </Avatar>
+            </Dropdown>
+          </div>
+        </div>
+
+        <div className="app-content">{children}</div>
+      </Layout>
+    </Layout>
+  )
 }
 
 function App() {
   const { token } = useAuth()
 
   return (
-    <BrowserRouter>
+    <Router>
       <Routes>
-        <Route path="/" element={<Navigate to="/auth" replace />} />
-        <Route path="/auth" element={token ? <Navigate to="/chat" replace /> : <AuthPage />} />
+        <Route path="/auth" element={<AuthPage />} />
         <Route
           path="/chat"
-          element={
-            <RequireAuth>
-              <AppShell activeKey="chat">
-                <ChatPage />
-              </AppShell>
-            </RequireAuth>
-          }
+          element={token ? <AppShell><ChatPage /></AppShell> : <Navigate to="/auth" />}
         />
         <Route
           path="/friends"
-          element={
-            <RequireAuth>
-              <AppShell activeKey="friends">
-                <FriendsPage />
-              </AppShell>
-            </RequireAuth>
-          }
+          element={token ? <AppShell><FriendsPage /></AppShell> : <Navigate to="/auth" />}
         />
         <Route
-          path="/settings"
-          element={
-            <RequireAuth>
-              <AppShell activeKey="settings">
-                <SettingsPage />
-              </AppShell>
-            </RequireAuth>
-          }
+          path="/profile/:userId"
+          element={token ? <AppShell><ProfilePage /></AppShell> : <Navigate to="/auth" />}
         />
+        <Route path="/" element={<Navigate to={token ? '/chat' : '/auth'} />} />
       </Routes>
-    </BrowserRouter>
+    </Router>
   )
 }
 

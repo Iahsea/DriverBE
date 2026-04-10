@@ -26,6 +26,7 @@ from app.core.security import verify_access_token, get_token_from_header
 from app.core.id_utils import normalize_uuid
 from app.core.crypto_bridge import crypto_bridge
 from app.database.models import User, Room, RoomMember, Message, Friendship
+from app.websocket.connection_manager import connection_manager
 from app.database.database import get_db
 from datetime import datetime
 import logging
@@ -102,12 +103,45 @@ async def list_rooms(
                 Message.room_id == room.id
             ).order_by(desc(Message.created_at)).first()
             
+            # Check if there are unread messages from other users
+            has_unread = False
+            try:
+                has_unread = db.query(Message).filter(
+                    (Message.room_id == room.id) &
+                    (Message.sender_id != current_user.id) &
+                    (Message.is_read == False)
+                ).first() is not None
+            except Exception as e:
+                # If is_read column doesn't exist yet, set has_unread to False
+                logger.debug(f"Note: Could not check unread status: {e}")
+                has_unread = False
+            
+            display_name = room.name
+            peer_id = None
+            if not room.is_group:
+                peer = next(
+                    (member.user for member in room.members if member.user_id != current_user.id),
+                    None,
+                )
+                if peer:
+                    display_name = peer.username
+                    peer_id = peer.id
+
+            last_message_preview = None
+            if last_message and last_message.content:
+                last_message_preview = last_message.content
+
             room_list = RoomListResponse(
                 id=room.id,
                 name=room.name,
                 is_group=room.is_group,
                 member_count=len(room.members) if room.members else 0,
                 last_message_at=last_message.created_at if last_message else None,
+                display_name=display_name,
+                peer_id=peer_id,
+                last_message_preview=last_message_preview,
+                has_unread=has_unread,
+                created_at=room.created_at,
             )
             rooms.append(room_list)
         
@@ -386,6 +420,14 @@ async def add_member(
         db.commit()
         db.refresh(new_member)
         
+        if room.is_group:
+            await connection_manager.broadcast_to_room(room_id_norm, {
+                "type": "system",
+                "content": f"👋 {new_user.username} đã tham gia phòng",
+                "user_id": new_user.id,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+
         logger.info(f"✓ Member {new_user.username} added to room {room.name}")
         
         return {
@@ -514,6 +556,8 @@ async def get_messages(
         ).order_by(desc(Message.created_at)).offset(skip).limit(limit).all()
         
         messages = []
+        messages_to_mark_read = []
+        
         for msg in messages_db:
             content = msg.content
             if msg.content_encrypted:
@@ -522,6 +566,21 @@ async def get_messages(
                 except Exception as e:
                     logger.warning(f"Failed to decrypt message {msg.id}: {e}")
 
+            # Mark messages as read if not sent by current user and not already read
+            # Use getattr with default False for backward compatibility if column doesn't exist
+            is_read = getattr(msg, 'is_read', False)
+            read_at = getattr(msg, 'read_at', None)
+            
+            try:
+                if msg.sender_id != current_user.id and not is_read:
+                    messages_to_mark_read.append(msg)
+                    msg.is_read = True
+                    msg.read_at = datetime.utcnow()
+                    is_read = True
+                    read_at = msg.read_at
+            except Exception as e:
+                logger.debug(f"Could not mark message as read: {e}")
+
             messages.append(MessageResponse(
                 id=msg.id,
                 room_id=msg.room_id,
@@ -529,9 +588,20 @@ async def get_messages(
                 sender_name=msg.sender.username,
                 content=content,
                 content_encrypted=msg.content_encrypted,
+                is_read=is_read,
+                read_at=read_at,
                 created_at=msg.created_at,
                 updated_at=msg.updated_at,
             ))
+        
+        # Commit read status updates
+        if messages_to_mark_read:
+            try:
+                db.commit()
+                logger.debug(f"Marked {len(messages_to_mark_read)} messages as read")
+            except Exception as e:
+                logger.error(f"Failed to mark messages as read: {e}")
+                db.rollback()
         
         # Reverse để sắp xếp từ cũ nhất đến mới nhất
         messages.reverse()

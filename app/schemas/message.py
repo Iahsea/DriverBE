@@ -31,6 +31,8 @@ class MessageResponse(BaseModel):
     sender_name: Optional[str] = Field(None, description="Tên người gửi (optional)")
     content: str = Field(..., description="Nội dung tin nhắn")
     content_encrypted: Optional[str] = Field(None, description="Nội dung mã hóa")
+    is_read: bool = Field(False, description="Tin nhắn đã được đọc hay chưa")
+    read_at: Optional[datetime] = Field(None, description="Thời gian đọc tin nhắn")
     created_at: datetime = Field(..., description="Thời gian gửi")
     updated_at: datetime = Field(..., description="Thời gian cập nhật")
     
@@ -44,8 +46,10 @@ class MessageResponse(BaseModel):
                 "sender_name": "john_doe",
                 "content": "Hello everyone!",
                 "content_encrypted": None,
+                "is_read": True,
+                "read_at": "2026-04-09T00:05:00",
                 "created_at": "2026-04-09T00:00:00",
-                "updated_at": "2026-04-09T00:00:00",
+                "updated_at": "2026-04-09T00:05:00",
             }
         }
 

@@ -39,6 +39,16 @@ async function deleteFriend(userId) {
   })
 }
 
+async function searchPeople(query, limit = 20) {
+  const params = new URLSearchParams({ query, limit: String(limit) })
+  return request(`/api/v1/friends/search?${params.toString()}`)
+}
+
+async function listFriendSuggestions(limit = 8) {
+  const params = new URLSearchParams({ limit: String(limit) })
+  return request(`/api/v1/friends/suggestions?${params.toString()}`)
+}
+
 export {
   listFriends,
   listFriendRequests,
@@ -47,4 +57,6 @@ export {
   rejectFriendRequest,
   cancelFriendRequest,
   deleteFriend,
+  searchPeople,
+  listFriendSuggestions,
 }

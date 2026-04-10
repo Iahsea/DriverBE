@@ -139,6 +139,8 @@ class Message(Base):
         sender_id: UUID của người gửi
         content: Nội dung tin nhắn (plaintext)
         content_encrypted: Nội dung mã hóa (AES)
+        is_read: Tin nhắn đã được đọc hay chưa
+        read_at: Thời gian đọc tin nhắn
         created_at: Thời gian gửi
         updated_at: Thời gian cập nhật
     """
@@ -149,6 +151,8 @@ class Message(Base):
     sender_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     content = Column(Text, nullable=False)
     content_encrypted = Column(Text, nullable=True)
+    is_read = Column(Boolean, default=False, nullable=False, index=True)
+    read_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

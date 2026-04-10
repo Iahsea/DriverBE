@@ -22,14 +22,15 @@ from datetime import datetime, timezone
 import jwt
 import json
 
-from app.database.database import init_db, SessionLocal
+from app.database.database import init_db, SessionLocal, engine
 from app.core.crypto_bridge import crypto_bridge
 from app.core.security import verify_access_token
 from app.core.id_utils import normalize_uuid
 from app.api.v1 import auth, rooms, friends
-from app.websocket.connection_manager import ConnectionManager
+from app.websocket.connection_manager import connection_manager
 from app.websocket.notification_manager import notification_manager
 from app.database.models import User, Room, RoomMember, Message
+from sqlalchemy import text
 
 # ==================== Logging Configuration ====================
 
@@ -38,6 +39,52 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ==================== Database Migration ====================
+
+def run_migrations():
+    """Add new columns to messages table if they don't exist"""
+    try:
+        with engine.begin() as connection:
+            # Try to add is_read column
+            try:
+                connection.execute(text(
+                    "ALTER TABLE messages ADD COLUMN is_read BOOLEAN DEFAULT FALSE NOT NULL"
+                ))
+                logger.info("✅ Added 'is_read' column to messages table")
+            except Exception as e:
+                if "Duplicate column" in str(e) or "already exists" in str(e):
+                    logger.debug("✓ 'is_read' column already exists")
+                else:
+                    logger.warning(f"⚠️ Could not add is_read column: {e}")
+            
+            # Try to add read_at column
+            try:
+                connection.execute(text(
+                    "ALTER TABLE messages ADD COLUMN read_at DATETIME NULL"
+                ))
+                logger.info("✅ Added 'read_at' column to messages table")
+            except Exception as e:
+                if "Duplicate column" in str(e) or "already exists" in str(e):
+                    logger.debug("✓ 'read_at' column already exists")
+                else:
+                    logger.warning(f"⚠️ Could not add read_at column: {e}")
+            
+            # Try to add index
+            try:
+                connection.execute(text(
+                    "CREATE INDEX idx_messages_is_read ON messages(is_read)"
+                ))
+                logger.info("✅ Created index on 'is_read' column")
+            except Exception as e:
+                if "Duplicate key name" in str(e) or "already exists" in str(e):
+                    logger.debug("✓ Index on 'is_read' already exists")
+                else:
+                    logger.debug(f"Index creation note: {e}")
+            
+            logger.info("✨ Database migrations completed")
+    except Exception as e:
+        logger.warning(f"⚠️ Migration error (backend will continue): {e}")
 
 # ==================== Startup/Shutdown Events ====================
 
@@ -56,6 +103,10 @@ async def lifespan(app: FastAPI):
         # Initialize database (create tables if not exist)
         init_db()
         logger.info("✓ Database initialized")
+        
+        # Run migrations
+        run_migrations()
+        
     except Exception as e:
         logger.error(f"✗ Database initialization failed: {e}")
     
@@ -175,9 +226,6 @@ async def ping():
 
 # ==================== WebSocket Endpoint ====================
 
-# Initialize connection manager (per-room)
-connection_manager = ConnectionManager()
-
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
 ALGORITHM = "HS256"
 
@@ -255,15 +303,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
             await connection_manager.connect(room_id_norm, user_id_norm, websocket)
             logger.info(f"[CONNECT] User {user_id_norm[:8]}... vào room {room_id_norm[:8]}... ({connection_manager.get_room_member_count(room_id_norm)} members)")
             
-            # ===== 5. Broadcast system message: user joined =====
+            # ===== 5. Connection accepted =====
             member_count = connection_manager.get_room_member_count(room_id_norm)
-            await connection_manager.broadcast_to_room(room_id_norm, {
-                "type": "system",
-                "content": f"👋 {user.username} đã tham gia phòng",
-                "user_id": user_id_norm,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-            
             logger.info(f"[WS] User {user_id[:8]}... connected to room {room_id[:8]}... ({member_count} members)")
             
             # ===== 6. Handle incoming messages =====
@@ -363,8 +404,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
             
             member_count = connection_manager.get_room_member_count(room_id_norm)
             
-            # Broadcast system message: user left
-            if member_count > 0:
+            # Broadcast system message: user left (group only)
+            if member_count > 0 and room.is_group:
                 await connection_manager.broadcast_to_room(room_id_norm, {
                     "type": "system",
                     "content": f"👋 {username} đã rời phòng",
@@ -389,28 +430,103 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
             pass
 
 
-# ==================== Error Handlers ====================
+# ==================== WebSocket /ws/notifications ====================
 
-@app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
-    """Global exception handler."""
-    logger.error(f"Unhandled exception: {exc}")
-    return {
-        "status": "error",
-        "message": "Internal server error",
-    }
-
-
-# ==================== Main Entry Point ====================
-
-if __name__ == "__main__":
-    import uvicorn
+@app.websocket("/ws/notifications")
+async def websocket_notifications(websocket: WebSocket):
+    """
+    WebSocket endpoint cho real-time notifications (friend requests, accepted, rejected, ...).
     
-    # Run server
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,  # Enable auto-reload on file changes
-        log_level="info",
-    )
+    Features:
+    - JWT token authentication via query params
+    - Real-time friend notifications
+    - Per-user connection management
+    - Automatic cleanup on disconnect
+    
+    Usage:
+    ws://localhost:8000/ws/notifications?token={JWT_TOKEN}
+    
+    Notification format:
+    {
+        "type": "friend_request|friend_request_accepted|friend_request_rejected|friend_request_canceled|friend_deleted",
+        "from_user_id": "...",
+        "from_username": "...",
+        "user_id": "...",
+        "username": "...",
+        "request_id": "...",
+        "message": "...",
+        "timestamp": "2026-04-09T10:30:00"
+    }
+    """
+    
+    user_id = None
+    
+    try:
+        # ===== 1. Lấy token từ query params =====
+        query_params = dict(
+            param.split("=") for param in websocket.scope.get("query_string", b"").decode().split("&") 
+            if "=" in param
+        )
+        token = query_params.get("token", "").replace("Bearer ", "")
+        
+        if not token:
+            await websocket.close(code=4001, reason="Token required")
+            logger.warning("Notification WebSocket rejected: no token provided")
+            return
+        
+        # ===== 2. Verify JWT token =====
+        try:
+            payload = verify_access_token(token)
+            user_id = payload.get("user_id")
+            
+            if not user_id:
+                await websocket.close(code=4001, reason="Invalid token: no user_id")
+                logger.warning("Notification WebSocket rejected: no user_id in token")
+                return
+        except Exception as e:
+            logger.warning(f"Notification WebSocket rejected: invalid token - {e}")
+            await websocket.close(code=4001, reason="Invalid token")
+            return
+        
+        # ===== 3. Verify user exists =====
+        db = SessionLocal()
+        try:
+            user_id_norm = normalize_uuid(user_id)
+            user = db.query(User).filter(User.id == user_id_norm).first()
+            if not user:
+                await websocket.close(code=4004, reason="User not found")
+                logger.warning(f"Notification WebSocket rejected: user {user_id} not found")
+                return
+        finally:
+            db.close()
+        
+        # ===== 4. Connect user tới notification manager =====
+        await notification_manager.connect(user_id_norm, websocket)
+        logger.info(f"✓ Notification WebSocket connected for user {user_id_norm[:8]}...")
+        
+        # ===== 5. Keep connection alive (ping/pong) =====
+        while True:
+            data = await websocket.receive_text()
+            
+            # Handle ping/pong để giữ connection sống
+            if data == "ping":
+                await websocket.send_text("pong")
+            elif data == "pong":
+                # Ignore pong
+                pass
+            else:
+                logger.debug(f"Received from {user_id[:8]}...: {data}")
+    
+    except WebSocketDisconnect:
+        if user_id:
+            user_id_norm = normalize_uuid(user_id)
+            notification_manager.disconnect(user_id_norm)
+            logger.info(f"✓ Notification WebSocket disconnected for user {user_id_norm[:8]}...")
+    
+    except Exception as e:
+        logger.error(f"Notification WebSocket error for user {user_id}: {e}")
+        if user_id:
+            notification_manager.disconnect(normalize_uuid(user_id))
+
+
+# ==================== Error Handlers ====================

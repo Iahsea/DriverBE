@@ -11,7 +11,7 @@ Endpoints:
 - DELETE /api/v1/friends/{user_id} - Xóa bạn/hủy quan hệ bạn bè
 """
 
-from fastapi import APIRouter, HTTPException, status, Depends, Header
+from fastapi import APIRouter, HTTPException, status, Depends, Header, Path
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_
 from app.schemas.friend import (
@@ -20,10 +20,13 @@ from app.schemas.friend import (
     FriendResponse,
     FriendRequestListResponse,
     FriendListResponse,
+    FriendSearchListResponse,
+    FriendSuggestionListResponse,
+    FriendSearchResponse,
 )
 from app.core.security import verify_access_token, get_token_from_header
 from app.core.id_utils import normalize_uuid
-from app.database.models import User, FriendRequest, Friendship
+from app.database.models import User, FriendRequest, Friendship, Room, RoomMember
 from app.database.database import get_db
 from app.websocket.notification_manager import notification_manager
 from datetime import datetime
@@ -31,6 +34,74 @@ import logging
 
 router = APIRouter(prefix="/friends", tags=["Friends"])
 logger = logging.getLogger(__name__)
+
+
+def get_friend_ids(user_id: str, db: Session) -> set[str]:
+    friendships = db.query(Friendship).filter(
+        or_(
+            Friendship.user_id_1 == user_id,
+            Friendship.user_id_2 == user_id,
+        )
+    ).all()
+    friend_ids: set[str] = set()
+    for friendship in friendships:
+        friend_ids.add(
+            friendship.user_id_2 if friendship.user_id_1 == user_id else friendship.user_id_1
+        )
+    return friend_ids
+
+
+def get_pending_user_ids(user_id: str, db: Session) -> set[str]:
+    pending = db.query(FriendRequest).filter(
+        and_(
+            FriendRequest.status == "pending",
+            or_(
+                FriendRequest.from_user_id == user_id,
+                FriendRequest.to_user_id == user_id,
+            ),
+        )
+    ).all()
+    pending_ids: set[str] = set()
+    for req in pending:
+        other_id = req.to_user_id if req.from_user_id == user_id else req.from_user_id
+        pending_ids.add(other_id)
+    return pending_ids
+
+
+def get_mutual_counts(friend_ids: set[str], db: Session) -> dict[str, int]:
+    if not friend_ids:
+        return {}
+    mutual_friendships = db.query(Friendship).filter(
+        or_(
+            Friendship.user_id_1.in_(friend_ids),
+            Friendship.user_id_2.in_(friend_ids),
+        )
+    ).all()
+    counts: dict[str, int] = {}
+    for friendship in mutual_friendships:
+        if friendship.user_id_1 in friend_ids:
+            other_id = friendship.user_id_2
+        else:
+            other_id = friendship.user_id_1
+        counts[other_id] = counts.get(other_id, 0) + 1
+    return counts
+
+
+def find_direct_room(user_id_1: str, user_id_2: str, db: Session) -> Room | None:
+    member_1 = db.query(RoomMember).subquery()
+    member_2 = db.query(RoomMember).subquery()
+    room = db.query(Room).join(
+        member_1,
+        Room.id == member_1.c.room_id,
+    ).join(
+        member_2,
+        Room.id == member_2.c.room_id,
+    ).filter(
+        Room.is_group.is_(False),
+        member_1.c.user_id == user_id_1,
+        member_2.c.user_id == user_id_2,
+    ).first()
+    return room
 
 
 def get_current_user(authorization: str = Header(...), db: Session = Depends(get_db)) -> User:
@@ -169,6 +240,133 @@ async def get_friend_requests(
     
     except Exception as e:
         logger.error(f"Unexpected error in get_friend_requests: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Lỗi hệ thống",
+        )
+
+
+# ==================== GET /api/v1/friends/search ====================
+
+@router.get(
+    "/search",
+    response_model=FriendSearchListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Tìm user theo tên hoặc email",
+)
+async def search_users(
+    query: str,
+    limit: int = 20,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FriendSearchListResponse:
+    """
+    Tìm user theo username hoặc email (không bao gồm bản thân, bạn bè, pending requests).
+    """
+    try:
+        query_text = (query or "").strip()
+        if not query_text:
+            return FriendSearchListResponse(total=0, results=[])
+
+        max_limit = min(max(limit, 1), 50)
+        friend_ids = get_friend_ids(current_user.id, db)
+        pending_ids = get_pending_user_ids(current_user.id, db)
+        excluded_ids = friend_ids.union(pending_ids, {current_user.id})
+
+        users = db.query(User).filter(
+            and_(
+                or_(
+                    User.username.ilike(f"%{query_text}%"),
+                    User.email.ilike(f"%{query_text}%"),
+                ),
+                ~User.id.in_(excluded_ids),
+            )
+        ).limit(max_limit).all()
+
+        mutual_counts = get_mutual_counts(friend_ids, db)
+        results = [
+            FriendSearchResponse(
+                id=user.id,
+                username=user.username,
+                email=user.email,
+                mutual_count=mutual_counts.get(user.id, 0),
+            )
+            for user in users
+        ]
+
+        return FriendSearchListResponse(total=len(results), results=results)
+
+    except Exception as e:
+        logger.error(f"Unexpected error in search_users: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Lỗi hệ thống",
+        )
+
+
+# ==================== GET /api/v1/friends/suggestions ====================
+
+@router.get(
+    "/suggestions",
+    response_model=FriendSuggestionListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Gợi ý bạn bè theo số bạn chung",
+)
+async def get_friend_suggestions(
+    limit: int = 8,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FriendSuggestionListResponse:
+    """
+    Gợi ý user chưa kết bạn, ưu tiên nhiều bạn chung nhất.
+    """
+    try:
+        max_limit = min(max(limit, 1), 20)
+        friend_ids = get_friend_ids(current_user.id, db)
+        pending_ids = get_pending_user_ids(current_user.id, db)
+        excluded_ids = friend_ids.union(pending_ids, {current_user.id})
+
+        mutual_counts = get_mutual_counts(friend_ids, db)
+        if current_user.id in mutual_counts:
+            mutual_counts.pop(current_user.id, None)
+
+        sorted_candidates = sorted(
+            mutual_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+
+        candidate_ids = [
+            user_id for user_id, _ in sorted_candidates if user_id not in excluded_ids
+        ][:max_limit]
+
+        users = []
+        if candidate_ids:
+            users = db.query(User).filter(User.id.in_(candidate_ids)).all()
+            user_map = {user.id: user for user in users}
+            users = [user_map[user_id] for user_id in candidate_ids if user_id in user_map]
+
+        if len(users) < max_limit:
+            remaining = max_limit - len(users)
+            extra_users = db.query(User).filter(~User.id.in_(excluded_ids))\
+                .order_by(User.created_at.desc()).limit(remaining).all()
+            for extra in extra_users:
+                if extra.id not in {user.id for user in users}:
+                    users.append(extra)
+
+        suggestions = [
+            FriendSearchResponse(
+                id=user.id,
+                username=user.username,
+                email=user.email,
+                mutual_count=mutual_counts.get(user.id, 0),
+            )
+            for user in users
+        ]
+
+        return FriendSuggestionListResponse(total=len(suggestions), suggestions=suggestions)
+
+    except Exception as e:
+        logger.error(f"Unexpected error in get_friend_suggestions: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Lỗi hệ thống",
@@ -361,22 +559,41 @@ async def accept_friend_request(
         # Update status
         friend_request.status = "accepted"
         friend_request.updated_at = datetime.utcnow()
-        
+
         # Tạo friendship record (user_id_1 < user_id_2)
         user_id_1 = min(friend_request.from_user_id, friend_request.to_user_id)
         user_id_2 = max(friend_request.from_user_id, friend_request.to_user_id)
-        
+
         new_friendship = Friendship(
             user_id_1=user_id_1,
             user_id_2=user_id_2,
         )
-        
+
         db.add(new_friendship)
-        db.commit()
-        db.refresh(friend_request)
-        
+
         from_user = db.query(User).filter(User.id == friend_request.from_user_id).first()
         to_user = db.query(User).filter(User.id == friend_request.to_user_id).first()
+
+        # Create direct room if missing
+        existing_room = find_direct_room(friend_request.from_user_id, friend_request.to_user_id, db)
+        if not existing_room:
+            room_name = f"{from_user.username} & {to_user.username}"
+            new_room = Room(
+                name=room_name,
+                description=None,
+                is_group=False,
+                created_by_id=current_user.id,
+            )
+            db.add(new_room)
+            db.flush()
+
+            db.add_all([
+                RoomMember(room_id=new_room.id, user_id=friend_request.from_user_id, role="member"),
+                RoomMember(room_id=new_room.id, user_id=friend_request.to_user_id, role="member"),
+            ])
+
+        db.commit()
+        db.refresh(friend_request)
         
         logger.info(f"✓ Friend request accepted: {from_user.username} ↔ {to_user.username}")
         
@@ -658,7 +875,7 @@ async def cancel_friend_request(
     summary="Xóa bạn/hủy quan hệ bạn bè",
 )
 async def delete_friend(
-    user_id: str,
+    user_id: str = Path(..., pattern=r"^[0-9a-fA-F]{32}$"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> None:

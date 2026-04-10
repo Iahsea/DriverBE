@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { App as AntdApp, Card, Input, Button, Tabs, Divider } from 'antd'
 import { MailOutlined, LockOutlined, ArrowRightOutlined, UserOutlined } from '@ant-design/icons'
 import { useAuth } from '../store/auth.jsx'
+import '../styles/AuthPage.css'
 
 function AuthPage() {
   const navigate = useNavigate()
