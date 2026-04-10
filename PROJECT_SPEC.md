@@ -1,11 +1,13 @@
 # AI Chat Project Template: Secure Socket Chat with Kernel-Mode Crypto
 
 ## 1. Purpose and Scope
-Xây dựng hệ thống Chat bảo mật đa tầng hỗ trợ **1-to-1** và **Group Chat**, kết hợp giữa ứng dụng web hiện đại và bảo mật cấp thấp (Kernel-level):
-* **Frontend:** Sử dụng **ReactJS** (Hooks, Context API/Redux) để xây dựng giao diện người dùng.
-* **Backend:** Sử dụng **Python FastAPI** làm server điều phối, quản lý kết nối WebSocket, quản lý phòng chat và giao tiếp với Driver.
-* **Kernel Security:** Mọi hoạt động mã hóa **AES** và băm **MD5** phải thực hiện trong **Kernel Driver** (Windows KMDF hoặc Linux LKM) thông qua cơ chế IOCTL.
+Xây dựng hệ thống Chat bảo mật đa tầng hỗ trợ **1-to-1** và **Group Chat**, kết hợp giữa ứng dụng web hiện đại và mã hóa **Backend-side via Kernel Driver**:
+* **Frontend:** Sử dụng **ReactJS** (Hooks, Context API/Redux) để xây dựng giao diện người dùng. **Gửi plaintext message** tới Backend qua WebSocket (không mã hóa ở client).
+* **Backend:** Sử dụng **Python FastAPI** làm server điều phối, quản lý kết nối WebSocket, quản lý phòng chat. **Backend GỌI KERNEL DRIVER để mã hóa message** (AES-256-CBC) trước khi broadcast.
+* **Backend Encryption via Driver:** Client gửi plaintext → Backend nhận → Backend gọi Driver encrypt (IOCTL) → Lưu plaintext + encrypted vào database → Broadcast encrypted tới members → Client nhận và có thể decrypt.
+* **Authentication:** Dùng JWT token và Kernel Driver (**Windows KMDF** hoặc **Linux LKM**) để hash password (MD5).
 * **Group Chat:** Hỗ trợ tạo phòng chat, thêm/xóa thành viên, quản lý quyền hạn (Admin, Member).
+* **Friendship System:** Hỗ trợ gửi/chấp nhận lời mời kết bạn, quản lý danh sách bạn bè.
 * **Target:** Thử nghiệm trên **Windows** trước khi triển khai chính thức trên **Ubuntu**.
 
 ---
@@ -102,8 +104,8 @@ CREATE TABLE messages (
     id VARCHAR(36) NOT NULL PRIMARY KEY COMMENT 'UUID string',
     room_id VARCHAR(36) NOT NULL COMMENT 'ID phòng',
     sender_id VARCHAR(36) NOT NULL COMMENT 'ID người gửi',
-    content TEXT NOT NULL COMMENT 'Nội dung tin nhắn (plaintext hoặc encrypted)',
-    content_encrypted TEXT COMMENT 'Nội dung mã hóa bằng AES',
+    content TEXT NULL COMMENT 'Nội dung tin nhắn (DEPRECATED - for backward compatibility)',
+    content_encrypted TEXT NOT NULL COMMENT 'Nội dung mã hóa bằng AES (E2EE - required)',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'Thời gian gửi',
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'Thời gian cập nhật',
     FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
@@ -160,13 +162,15 @@ CREATE TABLE friendships (
   3. Thêm creator vào RoomMembers với role='admin'
   4. Trả về RoomResponse với list members"
 
-### Scenario 2: Gửi tin nhắn tới Group
+### Scenario 2: Gửi tin nhắn tới Group (Backend Driver Encryption)
 * **User:** "Gửi tin nhắn tới phòng chat group và mã hóa với Driver."
 * **AI:** "Sử dụng WebSocket `/ws/chat/{room_id}`:
-  1. Client gửi message
-  2. Backend hash/encrypt với crypto_bridge
-  3. Lưu vào Messages table
-  4. Broadcast tới tất cả members trong room"
+  1. Client gửi plaintext message
+  2. Backend nhận plaintext
+  3. Backend GỌI DRIVER encrypt (IOCTL_ENCRYPT_AES) - AES-256-CBC
+  4. Lưu BOTH plaintext + encrypted vào Messages table
+  5. Broadcast encrypted message tới tất cả members trong room
+  6. Client nhận encrypted → giải mã hoặc hiển thị plaintext"
 
 ### Scenario 3: Quản lý thành viên (với Friendship)
 * **User:** "Thêm user mới vào group chat."
@@ -236,9 +240,23 @@ CREATE TABLE friendships (
 | WS | `/ws/notifications` | Nhận thông báo real-time (lời mời kết bạn, chấp nhận, từ chối, ...) |
 | WS | `/ws/chat/{room_id}` | Nhận tin nhắn real-time và thông báo group chat |
 
-## 7. Instructions for the AI & User
-* **AI:** Phải nhớ Backend dùng **Python/FastAPI** và Frontend dùng **React**. Ưu tiên viết code sạch, sử dụng `async/await` cho Backend và Functional Components/Hooks cho Frontend. Group Chat phải quản lý room subscriptions và member permissions.
-* **User:** Đảm bảo cài đặt đầy đủ môi trường (Python 3.10+, Node.js, C++ Build Tools) và chạy Terminal với quyền **Admin** khi test Driver trên Windows. Khi tạo group chat, luôn verify permissions (creator là admin).
+## 6.3. API Endpoints - Message Management (NEW - Backend Decryption)
+
+| Method | Endpoint | Mô tả |
+|--------|----------|-------|
+| GET | `/api/v1/messages/{message_id}` | Lấy chi tiết message (encrypted) |
+| POST | `/api/v1/messages/{message_id}/decrypt` | **Giải mã message - Backend decrypt** |
+| GET | `/api/v1/messages/room/{room_id}` | Lấy history messages của room (paginated) |
+
+---
+
+## 7. Instructions for the AI & User (Updated)
+* **AI:** Phải nhớ Backend dùng **Python/FastAPI** và Frontend dùng **React**. Ưu tiên viết code sạch, sử dụng `async/await` cho Backend và Functional Components/Hooks cho Frontend. 
+  - **Message Flow:** Backend MÃ HÓA (Driver) khi Client1 gửi, **Decrypt API** để Client2 giải mã khi request
+  - Backend LUÔN lưu BOTH plaintext + encrypted vào database
+  - Broadcast encrypted tới room members
+  - Client2 có thể dùng plaintext từ WebSocket broadcast HOẶC call decrypt API để lấy plaintext
+* **User:** Đảm bảo cài đặt đầy đủ môi trường (Python 3.10+, Node.js, C++ Build Tools) và chạy Terminal với quyền **Admin** khi test Driver trên Windows.
 
 ---
 
@@ -271,7 +289,7 @@ Client A → GET /api/v1/friends → Backend:
   - Trả về: List[FriendResponse]
 ```
 
-## 8.1. Message Flow - Group Chat (Cập nhật với Friendship)
+## 8.1. Message Flow - Group Chat (Backend Encryption via Kernel Driver)
 
 ### 1. Tạo phòng group:
 ```
@@ -281,15 +299,87 @@ Client → POST /api/v1/rooms → Backend:
   - Trả về RoomResponse
 ```
 
-### 2. Gửi tin nhắn tới group:
+### 2. Gửi tin nhắn tới group (Backend Driver Encryption):
 ```
-Client 1 → WS /ws/chat/{room_id} → Backend:
-  - Nhận message từ client
-  - Verify user là member của room
-  - Hash/Encrypt với crypto_bridge
-  - Lưu vào Messages table
-  - Broadcast tới tất cả members (client trong room)
-  - Client 2, 3, ... nhận message
+┌─────────────────────────────────────────────────────────────────┐
+│ CLIENT 1 SIDE:                                                  │
+│   - User gõ message: "Hello"                                    │
+│   - Client 1 gửi PLAINTEXT payload tới Backend                 │
+│   - WebSocket: POST /ws/chat/{room_id}?token=JWT_TOKEN         │
+│   - Message JSON: { "content": "Hello" }                       │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ BACKEND SIDE:                                                   │
+│   1. Nhận plaintext message từ Client 1                        │
+│   2. Verify user là member của room                            │
+│   3. GỌI KERNEL DRIVER: encrypt_aes_with_driver()            │
+│      - IOCTL_ENCRYPT_AES (AES-256-CBC)                        │
+│      - Plaintext: "Hello" → Ciphertext: "x9a2b3c..."         │
+│   4. Lưu vào Messages table:                                   │
+│      - content = "Hello" (plaintext)                           │
+│      - content_encrypted = "x9a2b3c..." (encrypted)           │
+│   5. Broadcast tới tất cả members trong room:                  │
+│      { "type": "message", "content_encrypted": "x9a2b3c..." }│
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ CLIENT 2,3,... SIDE:                                            │
+│   - Nhận encrypted payload từ Backend                           │
+│   - GỌI WEB CRYPTO API: decrypt AES-256-CBC                   │
+│   - Ciphertext: "x9a2b3c..." → Plaintext: "Hello"            │
+│   - Hiển thị plaintext message: "Hello"                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.1. Giải mã tin nhắn - Client2 Request Backend Decrypt (NEW):
+```
+CLIENT 2 SIDE:
+  - Nhận encrypted payload từ WebSocket: { "content_encrypted": "x9a2b3c..." }
+  - User click "View Message" hoặc decrypt tự động
+  - Frontend call: POST /api/v1/messages/{message_id}/decrypt
+  - Gửi HTTP request với JWT token
+
+BACKEND SIDE:
+  1. Xác thực JWT token
+  2. Verify user là member của room chứa message
+  3. Query Message từ database: message = db.query(Message).filter(id=message_id)
+  4. Gọi crypto_bridge để decrypt:
+     plaintext = await crypto_bridge.decrypt_message_payload(message.content_encrypted)
+     - Hàm này:
+       a) Base64 decode encrypted payload
+       b) Extract IV (16 bytes đầu)
+       c) Extract ciphertext (phần còn lại)
+       d) Gọi Kernel Driver IOCTL_DECRYPT_AES (hoặc mock crypto)
+       e) PKCS7 unpad plaintext
+       f) Return plaintext string
+  5. Trả về response:
+     {
+       "id": "message_id",
+       "room_id": "room_id",
+       "sender_id": "user_id",
+       "content_plaintext": "Hello",  // ✓ Decrypted plaintext
+       "created_at": "2026-04-09T...",
+       "message": "Message decrypted successfully"
+     }
+
+CLIENT 2 SIDE (after decrypt):
+  - Nhận plaintext từ API response
+  - Hiển thị message: "Hello"
+  - Hoặc cache result để dùng lần sau
+```
+
+### 2.2. Alternative - Client2 Use Plaintext từ WebSocket (Fallback):
+```
+Nếu không muốn call API decrypt (hoặc decrypt không work):
+- Backend broadcast message cả plaintext + encrypted:
+  {
+    "type": "message",
+    "content": "Hello",                    # ← Plaintext (fallback)
+    "content_encrypted": "x9a2b3c..."     # ← Encrypted (main)
+  }
+- Client2 có thể hiển thị plaintext từ WebSocket luôn (không cần decrypt)
+- Hoặc client2 thử decrypt encrypted (nếu có key)
 ```
 
 ### 3. Quản lý members (với Friendship validation):
@@ -417,7 +507,14 @@ Client disconnect:
 - **Room Tables**: ✓ Created (Room, RoomMember, Message models)
 - **Friendship Tables**: ⏳ To be created (friend_requests, friendships)
 - **Notification System**: ✓ In-memory (via WebSocket /ws/notifications, no DB persistence yet)
-- **Encryption**: Fallback mock AES + MD5 via crypto_bridge (real driver pending)
+- **Message Encryption**: ✓ Backend-side AES-256-CBC via Kernel Driver (IOCTL_ENCRYPT_AES)
+- **Message Decryption API**: ✓ POST /api/v1/messages/{message_id}/decrypt endpoint
+- **Password Hashing**: ✓ MD5 via Kernel Driver (KMDF/LKM) or fallback mock
+- **Backend Role**: 
+  - ENCRYPT messages via Driver khi Client1 gửi
+  - Store both plaintext + encrypted
+  - Broadcast encrypted to room
+  - DECRYPT messages via API khi Client2 request
 
 ## 10. Friendship System Rules
 * **Kết bạn:** User phải gửi lời mời → user khác chấp nhận → tạo friendship record
@@ -441,12 +538,31 @@ Client disconnect:
 * **Message Format:** JSON đồng nhất với `type`, `user_id`/`from_user_id`, `username`/`from_username`, `message`, `timestamp`
 * **Broadcasting:** Mỗi sự kiện friend action phải broadcast tới tất cả users liên quan (sender + recipient)
 
-## 11. Fallback & Troubleshooting
-* **Mocking:** Nếu chưa có Driver, AI sẽ cung cấp mã giả lập (Mock) trong `crypto_bridge.py` bằng thư viện `cryptography` của Python để test luồng Socket.
-* **Error Handling:** Luôn xử lý lỗi mất kết nối WebSocket trên React và lỗi Timeout khi gọi xuống Driver từ FastAPI.
+## 11. Fallback & Troubleshooting (Backend Driver Encryption + Decrypt API)
+* **Kernel Driver Usage:** Driver được dùng để:
+  1. Hash password (MD5) - IOCTL_HASH_MD5 cho authentication
+  2. Encrypt message (AES-256-CBC) - IOCTL_ENCRYPT_AES khi Client1 gửi
+  3. Decrypt message (AES-256-CBC) - IOCTL_DECRYPT_AES khi call `/api/v1/messages/{id}/decrypt`
+* **Backend sẽ tự động fallback sang mock crypto** nếu Driver không tìm thấy:
+  - Windows KMDF driver not found → Use fallback Python cryptography library
+  - /dev/crypto_chat_driver not found (Linux) → Use fallback mock
+* **Message Decrypt API Flow:**
+  - Client2 nhận encrypted message qua WebSocket
+  - Client2 call: `POST /api/v1/messages/{message_id}/decrypt` (with JWT token)
+  - Backend verify user là member của room
+  - Backend call `crypto_bridge.decrypt_message_payload(ciphertext)` 
+  - Backend trả về plaintext trong response
+  - Client2 nhận và hiển thị plaintext
+* **Message Storage:** Backend lưu CẢ plaintext và encrypted vào database:
+  - `content` = plaintext (để hiển thị/broadcast)
+  - `content_encrypted` = AES-256-CBC ciphertext (via Driver)
+* **Error Handling:** 
+  - Xử lý lỗi mất kết nối WebSocket trên React
+  - Nếu Decrypt API thất bại: 401 (unauthorized), 403 (forbidden), 404 (not found), 422 (decrypt error)
+  - User sẽ thấy error message: "Failed to decrypt message" hoặc specific error detail
 * **Room Permissions**: Kiểm tra user là admin trước khi cho delete room hoặc manage members.
-* **Friendship Validation**: Kiểm tra friendship record trước khi thêm member vào group (chặn non-friends)
-* **Message Encryption**: Hiện tại lưu plaintext + encrypted version; cần migrate tới chỉ encrypted.
+* **Friendship Validation**: Kiểm tra friendship record trước khi thêm member vào group (chặn non-friends).
+* **Message Integrity**: Nếu ciphertext bị corruption, decrypt API sẽ return 422 "Decryption failed" - tự động phát hiện tampering.
 
 ## 11.1. Notification System Troubleshooting (NEW)
 * **WebSocket Connection Fails**: Verify JWT token hợp lệ và user tồn tại trước khi accept connection

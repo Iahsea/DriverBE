@@ -26,7 +26,7 @@ from app.database.database import init_db, SessionLocal, engine
 from app.core.crypto_bridge import crypto_bridge
 from app.core.security import verify_access_token
 from app.core.id_utils import normalize_uuid
-from app.api.v1 import auth, rooms, friends
+from app.api.v1 import auth, rooms, friends, messages
 from app.websocket.connection_manager import connection_manager
 from app.websocket.notification_manager import notification_manager
 from app.database.models import User, Room, RoomMember, Message
@@ -174,9 +174,16 @@ app.include_router(
     prefix="/api/v1",
 )
 
+# Messages routes: /api/v1/messages/*
+app.include_router(
+    messages.router,
+    prefix="/api/v1",
+)
+
 logger.info("✓ Auth routes registered at /api/v1/auth")
 logger.info("✓ Rooms routes registered at /api/v1/rooms")
 logger.info("✓ Friends routes registered at /api/v1/friends")
+logger.info("✓ Messages routes registered at /api/v1/messages")
 
 # ==================== Health Check Endpoints ====================
 
@@ -315,47 +322,36 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                 try:
                     data = json.loads(data_raw)
                     content = data.get("content", "").strip()
-                    content_encrypted = data.get("content_encrypted", "").strip()
                     
-                    if not content and not content_encrypted:
+                    # ===== 6a. Client sends plaintext - Backend receives =====
+                    if not content:
                         continue
-
-                    if content_encrypted:
-                        try:
-                            content = await crypto_bridge.decrypt_message_payload(content_encrypted)
-                        except Exception as e:
-                            logger.error(f"Decrypt incoming message failed: {e}")
-                            await connection_manager.send_personal_message(
-                                room_id_norm,
-                                user_id_norm,
-                                {
-                                    "type": "error",
-                                    "content": "Decrypt failed on server",
-                                },
-                            )
-                            continue
-                    else:
-                        try:
-                            content_encrypted = await crypto_bridge.encrypt_message_payload(content)
-                        except Exception as e:
-                            logger.error(f"Encrypt outgoing message failed: {e}")
-                            await connection_manager.send_personal_message(
-                                room_id_norm,
-                                user_id_norm,
-                                {
-                                    "type": "error",
-                                    "content": "Encrypt failed on server",
-                                },
-                            )
-                            continue
                     
-                    # ===== 7. Save message to database =====
+                    # ===== 6b. Backend calls Kernel Driver to encrypt =====
+                    try:
+                        # Call crypto_bridge to encrypt message using Driver (IOCTL_ENCRYPT_AES)
+                        # Returns encrypted ciphertext (base64 encoded with IV prepended)
+                        content_encrypted = await crypto_bridge.encrypt_message_payload(content)
+                    except Exception as e:
+                        logger.error(f"Backend Driver encrypt failed: {e}")
+                        await connection_manager.send_personal_message(
+                            room_id_norm,
+                            user_id_norm,
+                            {
+                                "type": "error",
+                                "message": "Backend encryption failed",
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                        continue
+                    
+                    # ===== 7. Save message to database (BOTH plaintext + encrypted) =====
                     message = Message(
                         id=None,  # Auto-generate UUID
                         room_id=room_id_norm,
                         sender_id=user_id_norm,
-                        content=content,
-                        content_encrypted=content_encrypted,
+                        content=content,  # Plaintext for display/logging
+                        content_encrypted=content_encrypted,  # Encrypted by Driver
                         created_at=datetime.utcnow(),
                         updated_at=datetime.utcnow(),
                     )
@@ -364,15 +360,16 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     db.commit()
                     db.refresh(message)
                     
-                    # ===== 8. Broadcast message to room members =====
+                    # ===== 8. Broadcast encrypted message to room members =====
+                    # Clients receive encrypted and can decrypt using Web Crypto API
                     await connection_manager.broadcast_to_room(room_id_norm, {
                         "type": "message",
                         "id": message.id,
                         "room_id": room_id_norm,
                         "sender_id": user_id_norm,
                         "sender_name": user.username,
-                        "content": content,
-                        "content_encrypted": message.content_encrypted,
+                        "content": content,  # For fallback if client can't decrypt
+                        "content_encrypted": message.content_encrypted,  # Encrypted by Driver
                         "created_at": message.created_at.isoformat(),
                         "updated_at": message.updated_at.isoformat(),
                         "timestamp": datetime.now(timezone.utc).isoformat(),
