@@ -230,15 +230,16 @@ function ChatPage() {
 
           // Update room list with new message preview and timestamp
           if (data.type === 'message' && data.id) {
-            console.log('🔄 Updating room list with new message:', data.content)
+            const displayContent = data.content_encrypted || data.content
+            console.log('🔄 Updating room list with new message:', displayContent)
             setRooms((prevRooms) => {
               const updatedRooms = prevRooms.map((r) => {
                 if (r.id === roomId) {
                   // For group chat, show "SenderName: message"
                   // For 1-1 chat, just show message
                   const preview = isGroupChat && data.sender_name
-                    ? `${data.sender_name}: ${data.content}`
-                    : data.content
+                    ? `${data.sender_name}: ${displayContent}`
+                    : displayContent
                   
                   return {
                     ...r,
@@ -621,7 +622,7 @@ function ChatPage() {
                         </Avatar>
                       )}
                       <div className={`message-bubble ${isSelf ? 'sent' : 'received'}`}>
-                        <div className="message-text">{item.content}</div>
+                        <div className="message-text">{item.content_encrypted || item.content}</div>
                         <div className="message-time">
                           {new Date(item.created_at || item.timestamp).toLocaleTimeString([], {
                             hour: '2-digit',
