@@ -32,6 +32,7 @@ import {
   removeRoomMember,
   deleteRoom,
 } from '../api/rooms.js'
+import { decryptMessage } from '../api/messages.js'
 import { API_BASE_URL } from '../api/client.js'
 import { useAuth } from '../store/auth.jsx'
 import '../styles/ChatPage.css'
@@ -67,6 +68,7 @@ function ChatPage() {
   const wsConnectionsRef = useRef(new Map()) // Store all room connections
   const activeRoomRef = useRef(null) // Track activeRoom without closure issue
   const userIdRef = useRef(user?.id) // Track user id without closure issue
+  const decryptedCacheRef = useRef(new Map()) // Cache for decrypted messages
 
   const currentUserId = normalizeId(user?.id)
   const members = roomDetails?.members || []
@@ -90,6 +92,32 @@ function ChatPage() {
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }
+
+  /**
+   * Giải mã message từ backend API
+   * Cache kết quả để tránh gọi API lặp lại
+   */
+  const decryptMessageContent = async (messageId, contentEncrypted) => {
+    // Check cache first
+    if (decryptedCacheRef.current.has(messageId)) {
+      return decryptedCacheRef.current.get(messageId)
+    }
+
+    try {
+      const response = await decryptMessage(messageId)
+      const plaintext = response.content_plaintext || contentEncrypted
+      
+      // Cache the result
+      decryptedCacheRef.current.set(messageId, plaintext)
+      console.log('✅ Message decrypted:', messageId)
+      
+      return plaintext
+    } catch (error) {
+      console.error('❌ Decryption failed for message:', messageId, error)
+      // Return encrypted content as fallback
+      return contentEncrypted
+    }
   }
 
   async function loadRooms() {
@@ -132,6 +160,27 @@ function ChatPage() {
       const batch = data.messages || []
       setMessages(batch)
       setEvents([])
+      
+      // Decrypt messages with encrypted content
+      batch.forEach((msg) => {
+        if (msg.content_encrypted && msg.id) {
+          decryptMessageContent(msg.id, msg.content_encrypted).then((decryptedContent) => {
+            setMessages((prev) => {
+              const idx = prev.findIndex((m) => m.id === msg.id)
+              if (idx >= 0) {
+                const updated = [...prev]
+                updated[idx] = {
+                  ...updated[idx],
+                  content_decrypted: decryptedContent,
+                }
+                return updated
+              }
+              return prev
+            })
+          })
+        }
+      })
+      
       const total = typeof data.total === 'number' ? data.total : batch.length
       const hasMore = batch.length < total
       setHasMoreMessages(hasMore)
@@ -165,6 +214,27 @@ function ChatPage() {
         hasMoreRef.current = false
       } else {
         setMessages((prev) => [...batch, ...prev])
+        
+        // Decrypt messages with encrypted content
+        batch.forEach((msg) => {
+          if (msg.content_encrypted && msg.id) {
+            decryptMessageContent(msg.id, msg.content_encrypted).then((decryptedContent) => {
+              setMessages((prev) => {
+                const idx = prev.findIndex((m) => m.id === msg.id)
+                if (idx >= 0) {
+                  const updated = [...prev]
+                  updated[idx] = {
+                    ...updated[idx],
+                    content_decrypted: decryptedContent,
+                  }
+                  return updated
+                }
+                return prev
+              })
+            })
+          }
+        })
+        
         const nextHasMore = skip + batch.length < total
         setHasMoreMessages(nextHasMore)
         hasMoreRef.current = nextHasMore
@@ -276,6 +346,25 @@ function ChatPage() {
               }
             } else if (data.type === 'message' && data.id) {
               console.log('📨 Adding message:', data.id, 'from:', data.sender_name)
+              
+              // Decrypt message if it has encrypted content
+              if (data.content_encrypted) {
+                decryptMessageContent(data.id, data.content_encrypted).then((decryptedContent) => {
+                  setMessages((prev) => {
+                    const idx = prev.findIndex((m) => m.id === data.id)
+                    if (idx >= 0) {
+                      // Update message with decrypted content
+                      const updated = [...prev]
+                      updated[idx] = {
+                        ...updated[idx],
+                        content_decrypted: decryptedContent,
+                      }
+                      return updated
+                    }
+                    return prev
+                  })
+                })
+              }
               
               setMessages((prev) => {
                 // Check if this message already exists (to avoid duplicates)
@@ -622,7 +711,9 @@ function ChatPage() {
                         </Avatar>
                       )}
                       <div className={`message-bubble ${isSelf ? 'sent' : 'received'}`}>
-                        <div className="message-text">{item.content_encrypted || item.content}</div>
+                        <div className="message-text">
+                          {item.content_decrypted || item.content_encrypted || item.content}
+                        </div>
                         <div className="message-time">
                           {new Date(item.created_at || item.timestamp).toLocaleTimeString([], {
                             hour: '2-digit',
