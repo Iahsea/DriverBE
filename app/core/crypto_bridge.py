@@ -24,9 +24,17 @@ logger = logging.getLogger(__name__)
 
 class IOCTLOperation(IntEnum):
     """IOCTL operation codes (phải khớp với Kernel Driver)"""
-    IOCTL_HASH_MD5 = 0x00000001
-    IOCTL_ENCRYPT_AES = 0x00000002
-    IOCTL_DECRYPT_AES = 0x00000003
+    # Using _IOW macro format: _IOW(type, nr, size)
+    # type = 'c' = 0x63, size calculated from ctypes structures
+    pass
+
+# Placeholder - will be calculated after struct definitions
+def _iow(type_char: int, nr: int, size: int) -> int:
+    """Calculate IOCTL code using _IOW macro"""
+    # _IOW(type, nr, size) = _IOC(_IOC_WRITE, type, nr, size)
+    # _IOC(dir, type, nr, size) = ((dir) << 30) | ((type) << 8) | ((nr) << 0) | ((size) << 16)
+    # _IOC_WRITE = 1
+    return ((1 << 30) | (type_char << 8) | nr | (size << 16))
 
 
 # ==================== ctypes Structures (Data Alignment) ====================
@@ -77,6 +85,14 @@ class AESBuffer(ctypes.Structure):
         ("data", ctypes.c_ubyte * 512),
         ("output", ctypes.c_ubyte * 512),
     ]
+
+# ==================== Calculate IOCTL Codes ====================
+# Now that structures are defined, populate IOCTLOperation enum
+CRYPTO_IOCTL_MAGIC = ord('c')  # 0x63
+
+IOCTLOperation.IOCTL_HASH_MD5 = _iow(CRYPTO_IOCTL_MAGIC, 1, ctypes.sizeof(MD5HashBuffer))
+IOCTLOperation.IOCTL_ENCRYPT_AES = _iow(CRYPTO_IOCTL_MAGIC, 2, ctypes.sizeof(AESBuffer))
+IOCTLOperation.IOCTL_DECRYPT_AES = _iow(CRYPTO_IOCTL_MAGIC, 3, ctypes.sizeof(AESBuffer))
 
 
 # ==================== Crypto Bridge Class ====================
@@ -701,8 +717,7 @@ class CryptoBridge:
         hash_obj = hashlib.md5(password.encode("utf-8"))
         return hash_obj.hexdigest()
 
-    @staticmethod
-    def _encrypt_mock(plaintext: bytes, key: bytes, iv: bytes) -> bytes:
+    def _encrypt_mock(self, plaintext: bytes, key: bytes, iv: bytes) -> bytes:
         """
         Mock AES encrypt - dùng library cryptography.
         
@@ -723,12 +738,13 @@ class CryptoBridge:
                 backend=default_backend(),
             )
             encryptor = cipher.encryptor()
-            return encryptor.update(plaintext) + encryptor.finalize()
+            result = encryptor.update(plaintext) + encryptor.finalize()
+            logger.debug(f"[Mock] Encrypted {len(plaintext)} bytes to {len(result)} bytes")
+            return result
         except ImportError:
             raise RuntimeError("cryptography library not installed")
 
-    @staticmethod
-    def _decrypt_mock(ciphertext: bytes, key: bytes, iv: bytes) -> bytes:
+    def _decrypt_mock(self, ciphertext: bytes, key: bytes, iv: bytes) -> bytes:
         """
         Mock AES decrypt.
         """

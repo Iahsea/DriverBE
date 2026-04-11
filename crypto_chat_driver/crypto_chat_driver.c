@@ -7,12 +7,14 @@
 #include <linux/uaccess.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <linux/ioctl.h>
 
 #define DEVICE_NAME "crypto_chat_driver"
+#define CRYPTO_IOCTL_MAGIC 'c'
 
-#define IOCTL_HASH_MD5    1
-#define IOCTL_ENCRYPT_AES 2
-#define IOCTL_DECRYPT_AES 3
+#define IOCTL_HASH_MD5    _IOW(CRYPTO_IOCTL_MAGIC, 1, struct md5_hash_buffer)
+#define IOCTL_ENCRYPT_AES _IOW(CRYPTO_IOCTL_MAGIC, 2, struct aes_buffer)
+#define IOCTL_DECRYPT_AES _IOW(CRYPTO_IOCTL_MAGIC, 3, struct aes_buffer)
 
 struct md5_hash_buffer {
     u32 dataLen;
@@ -321,36 +323,38 @@ static void aes_key_expand_256(const u8 *key, u8 *round_keys)
     int i;
     u8 temp[4];
     int bytes = 32;
-    int rcon_iter = 1;
+    int rcon_iter = 0;
 
+    // Copy initial key
     memcpy(round_keys, key, 32);
 
     while (bytes < 240) {
-        temp[0] = round_keys[bytes - 4];
-        temp[1] = round_keys[bytes - 3];
-        temp[2] = round_keys[bytes - 2];
-        temp[3] = round_keys[bytes - 1];
+        // Get last 4 bytes
+        for (i = 0; i < 4; i++)
+            temp[i] = round_keys[bytes - 4 + i];
 
+        // Apply transformation every 32 bytes (every 2 words in AES-256)
         if ((bytes % 32) == 0) {
+            // RotWord: rotate left by 1 byte
             u8 t = temp[0];
             temp[0] = temp[1];
             temp[1] = temp[2];
             temp[2] = temp[3];
             temp[3] = t;
 
-            temp[0] = aes_sbox[temp[0]];
-            temp[1] = aes_sbox[temp[1]];
-            temp[2] = aes_sbox[temp[2]];
-            temp[3] = aes_sbox[temp[3]];
+            // SubWord: apply S-box
+            for (i = 0; i < 4; i++)
+                temp[i] = aes_sbox[temp[i]];
 
+            // XOR with round constant
             temp[0] ^= aes_rcon[rcon_iter++];
         } else if ((bytes % 32) == 16) {
-            temp[0] = aes_sbox[temp[0]];
-            temp[1] = aes_sbox[temp[1]];
-            temp[2] = aes_sbox[temp[2]];
-            temp[3] = aes_sbox[temp[3]];
+            // For AES-256, every other block also gets SubWord applied
+            for (i = 0; i < 4; i++)
+                temp[i] = aes_sbox[temp[i]];
         }
 
+        // Generate 4 new bytes
         for (i = 0; i < 4; i++) {
             round_keys[bytes] = round_keys[bytes - 32] ^ temp[i];
             bytes++;
@@ -457,21 +461,37 @@ static long crypto_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
 
     if (cmd == IOCTL_ENCRYPT_AES || cmd == IOCTL_DECRYPT_AES) {
-        struct aes_buffer buf;
+        struct aes_buffer *buf;
         int ret;
         bool encrypt = (cmd == IOCTL_ENCRYPT_AES);
 
-        if (copy_from_user(&buf, (void __user *)arg, sizeof(buf)))
+        // Allocate on heap instead of stack to avoid stack overflow
+        buf = kmalloc(sizeof(struct aes_buffer), GFP_KERNEL);
+        if (!buf)
+            return -ENOMEM;
+
+        if (copy_from_user(buf, (void __user *)arg, sizeof(*buf))) {
+            kfree(buf);
             return -EFAULT;
-        if (buf.dataLen > 512)
+        }
+        
+        if (buf->dataLen > 512) {
+            kfree(buf);
             return -EINVAL;
+        }
 
-        ret = do_aes_cbc(buf.data, buf.dataLen, buf.key, buf.iv, buf.output, encrypt);
-        if (ret)
+        ret = do_aes_cbc(buf->data, buf->dataLen, buf->key, buf->iv, buf->output, encrypt);
+        
+        if (ret) {
+            kfree(buf);
             return ret;
+        }
 
-        if (copy_to_user((void __user *)arg, &buf, sizeof(buf)))
+        if (copy_to_user((void __user *)arg, buf, sizeof(*buf))) {
+            kfree(buf);
             return -EFAULT;
+        }
+        kfree(buf);
         return 0;
     }
 
