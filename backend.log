@@ -1,0 +1,23 @@
+   ⚠️  Kernel driver disabled (key expansion bug) - using mock implementation
+⚠️  Using mock cryptography implementation (development only)
+2026-04-11 18:27:35,937 - main - INFO - ✓ CORS configured for origins: ['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:3000', 'http://127.0.0.1:5173']
+2026-04-11 18:27:35,980 - main - INFO - ✓ Auth routes registered at /api/v1/auth
+2026-04-11 18:27:35,981 - main - INFO - ✓ Rooms routes registered at /api/v1/rooms
+2026-04-11 18:27:35,981 - main - INFO - ✓ Friends routes registered at /api/v1/friends
+2026-04-11 18:27:35,981 - main - INFO - ✓ Messages routes registered at /api/v1/messages
+INFO:     Started server process [17612]
+INFO:     Waiting for application startup.
+2026-04-11 18:27:35,985 - main - INFO - 🚀 FastAPI Application Starting...
+2026-04-11 18:27:36,020 - main - INFO - ✓ Database initialized
+2026-04-11 18:27:36,025 - main - DEBUG - ✓ 'is_read' column already exists
+2026-04-11 18:27:36,028 - main - DEBUG - ✓ 'read_at' column already exists
+2026-04-11 18:27:36,030 - main - DEBUG - ✓ Index on 'is_read' already exists
+2026-04-11 18:27:36,030 - main - INFO - ✨ Database migrations completed
+2026-04-11 18:27:36,031 - main - INFO - ✓ Application ready to handle requests
+INFO:     Application startup complete.
+ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 8000): address already in use
+INFO:     Waiting for application shutdown.
+2026-04-11 18:27:36,033 - main - INFO - 🛑 FastAPI Application Shutting Down...
+2026-04-11 18:27:36,034 - main - INFO - ✓ Crypto bridge cleanup completed
+2026-04-11 18:27:36,034 - main - INFO - ✓ Application shutdown complete
+INFO:     Application shutdown complete.

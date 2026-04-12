@@ -300,7 +300,7 @@ function ChatPage() {
 
           // Update room list with new message preview and timestamp
           if (data.type === 'message' && data.id) {
-            const displayContent = data.content_encrypted || data.content
+            const displayContent = data.content
             console.log('🔄 Updating room list with new message:', displayContent)
             setRooms((prevRooms) => {
               const updatedRooms = prevRooms.map((r) => {
@@ -347,45 +347,54 @@ function ChatPage() {
             } else if (data.type === 'message' && data.id) {
               console.log('📨 Adding message:', data.id, 'from:', data.sender_name)
               
-              // Decrypt message if it has encrypted content
+              // Decrypt message if it has encrypted content, then add to state
               if (data.content_encrypted) {
                 decryptMessageContent(data.id, data.content_encrypted).then((decryptedContent) => {
                   setMessages((prev) => {
-                    const idx = prev.findIndex((m) => m.id === data.id)
-                    if (idx >= 0) {
-                      // Update message with decrypted content
+                    // Check if this message already exists
+                    const existingIndex = prev.findIndex((m) => m.id === data.id)
+                    
+                    if (existingIndex >= 0) {
+                      // Update existing message with decrypted content
                       const updated = [...prev]
-                      updated[idx] = {
-                        ...updated[idx],
+                      updated[existingIndex] = {
+                        ...updated[existingIndex],
                         content_decrypted: decryptedContent,
                       }
                       return updated
                     }
-                    return prev
+                    
+                    // Add as new message
+                    if (normalizeId(data.sender_id) === normalizeId(userIdRef.current)) {
+                      const filteredMessages = prev.filter((m) => !m.id.startsWith('temp-'))
+                      return [...filteredMessages, { ...data, content_decrypted: decryptedContent }]
+                    }
+                    
+                    return [...prev, { ...data, content_decrypted: decryptedContent }]
                   })
+                  setTimeout(scrollToBottom, 50)
                 })
+              } else {
+                // No encryption, add directly
+                setMessages((prev) => {
+                  const existingIndex = prev.findIndex((m) => m.id === data.id)
+                  
+                  if (existingIndex >= 0) {
+                    console.log('⚠️ Message already exists, skipping')
+                    return prev
+                  }
+                  
+                  if (normalizeId(data.sender_id) === normalizeId(userIdRef.current)) {
+                    console.log('✅ Own message, replacing temp message')
+                    const filteredMessages = prev.filter((m) => !m.id.startsWith('temp-'))
+                    return [...filteredMessages, data]
+                  }
+                  
+                  console.log('✅ Other user message, adding to list')
+                  return [...prev, data]
+                })
+                setTimeout(scrollToBottom, 50)
               }
-              
-              setMessages((prev) => {
-                // Check if this message already exists (to avoid duplicates)
-                const existingIndex = prev.findIndex((m) => m.id === data.id)
-                
-                if (existingIndex >= 0) {
-                  console.log('⚠️ Message already exists, skipping')
-                  return prev
-                }
-                
-                // If sender is current user, remove temporary messages
-                if (normalizeId(data.sender_id) === normalizeId(userIdRef.current)) {
-                  console.log('✅ Own message, replacing temp message')
-                  const filteredMessages = prev.filter((m) => !m.id.startsWith('temp-'))
-                  return [...filteredMessages, data]
-                }
-                
-                console.log('✅ Other user message, adding to list')
-                return [...prev, data]
-              })
-              setTimeout(scrollToBottom, 50)
             }
           } else {
             console.log('⏭️ Message for inactive room:', roomId, 'current active:', activeRoomRef.current?.id)
@@ -712,7 +721,7 @@ function ChatPage() {
                       )}
                       <div className={`message-bubble ${isSelf ? 'sent' : 'received'}`}>
                         <div className="message-text">
-                          {item.content_decrypted || item.content_encrypted || item.content}
+                          {item.content_decrypted || item.content}
                         </div>
                         <div className="message-time">
                           {new Date(item.created_at || item.timestamp).toLocaleTimeString([], {
