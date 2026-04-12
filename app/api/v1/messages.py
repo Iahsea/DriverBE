@@ -111,6 +111,7 @@ async def get_message(
         sender_id=message.sender_id,
         content=message.content,
         content_encrypted=message.content_encrypted,
+        message_hash=message.message_hash,
         created_at=message.created_at,
         updated_at=message.updated_at,
     )
@@ -137,15 +138,35 @@ async def decrypt_message(
     Giải mã (decrypt) một message đã mã hóa.
     
     Backend sẽ dùng Kernel Driver (hoặc mock crypto) để giải mã 
-    encrypted message và trả về plaintext.
+    encrypted message và trả về plaintext + message_hash để Client2 xác thực.
     
-    Flow:
-    1. Client2 nhận encrypted message qua WebSocket
-    2. Client2 call POST /api/v1/messages/{message_id}/decrypt
-    3. Backend nhận request, kiểm tra permissions
-    4. Backend call crypto_bridge.decrypt_message_payload()
-    5. Backend trả về plaintext trong response
-    6. Client2 hiển thị plaintext
+    SECURITY FLOW:
+    1. Client2 nhận {content_encrypted, message_hash} qua WebSocket
+    2. Client2 gọi POST /api/v1/messages/{message_id}/decrypt để lấy plaintext
+    3. Backend trả về plaintext + message_hash
+    4. Client2 (MUST) compute MD5(plaintext) và so sánh với message_hash
+       - Nếu match: ✅ Message verified (không bị sửa đổi)
+       - Nếu mismatch: ⚠️ Tampering detected (có thể bị attacker sửa)
+    5. Client2 hiển thị message với verification indicator
+    
+    CLIENT2 IMPLEMENTATION (Frontend):
+    ```javascript
+    // 1. Decrypt
+    const response = await decryptMessage(messageId)
+    const { content_plaintext, message_hash } = response
+    
+    // 2. Compute MD5 (IMPORTANT!)
+    const localHash = await computeMD5(content_plaintext)
+    
+    // 3. Verify (IMPORTANT!)
+    const isValid = localHash === message_hash
+    
+    if (isValid) {
+      console.log("✅ Message integrity verified")
+    } else {
+      console.warn("⚠️ Message integrity check FAILED - data may have been modified")
+    }
+    ```
     
     Returns:
         {
@@ -153,6 +174,7 @@ async def decrypt_message(
             "room_id": "room_id",
             "sender_id": "user_id",
             "content_plaintext": "Hello",  # Decrypted plaintext
+            "message_hash": "802c21ae4d9853d40ef331b4bb2bb22c",  # For verification
             "created_at": "2026-04-10T...",
             "message": "Message decrypted successfully"
         }
@@ -189,6 +211,7 @@ async def decrypt_message(
             room_id=message.room_id,
             sender_id=message.sender_id,
             content_plaintext=plaintext,
+            message_hash=message.message_hash,
             created_at=message.created_at,
             message="Message decrypted successfully",
         )
@@ -204,6 +227,108 @@ async def decrypt_message(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Decryption failed: {str(e)}",
+        )
+
+
+@router.post(
+    "/{message_id}/verify-integrity",
+    summary="Verify message integrity via backend (optional helper)",
+    responses={
+        200: {"description": "Verification result"},
+        401: {"description": "Unauthorized"},
+        404: {"description": "Message not found"},
+    },
+)
+async def verify_message_integrity(
+    message_id: str,
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Optional helper endpoint: Backend verifies message integrity.
+    
+    Client2 can call this to have backend verify the hash,
+    but PRIMARY verification should be done CLIENT-SIDE for security reasons.
+    
+    ⚠️ SECURITY NOTE:
+    If attacker modifies both message AND hash in transit,
+    this endpoint could also be fooled. For true security,
+    Client2 MUST verify independently (compute hash locally).
+    
+    This endpoint is useful for:
+    - Audit logging
+    - Compliance verification
+    - Double-checking (Client2 can compare results)
+    
+    Request:
+        POST /api/v1/messages/{message_id}/verify-integrity
+        {
+            "plaintext_received": "Hello"  # Plaintext Client2 decrypted
+        }
+    
+    Response:
+        {
+            "verified": true,                               # Hash matches
+            "message_hash": "802c21ae4d9853d40ef331b4bb2bb22c",
+            "message": "Message integrity verified",
+            "status": "verified"                            # or "mismatch" or "error"
+        }
+    """
+    try:
+        message_id_norm = normalize_uuid(message_id)
+        message = db.query(Message).filter(Message.id == message_id_norm).first()
+        
+        if not message:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Message không tồn tại",
+            )
+        
+        # Verify user is member of room
+        member = db.query(RoomMember).filter(
+            (RoomMember.room_id == message.room_id) &
+            (RoomMember.user_id == current_user.id)
+        ).first()
+        
+        if not member:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Bạn không phải member của room chứa message này",
+            )
+        
+        # Get plaintext from request
+        plaintext_received = body.get("plaintext_received", "")
+        
+        # Compute hash of received plaintext
+        expected_hash = await crypto_bridge.hash_message_content(plaintext_received)
+        
+        # Compare with stored hash
+        stored_hash = message.message_hash or ""
+        verified = expected_hash == stored_hash
+        
+        status_msg = "verified" if verified else "mismatch"
+        
+        logger.info(
+            f"Message {message_id_norm[:8]}... integrity check: {status_msg} "
+            f"(received: {expected_hash}, stored: {stored_hash})"
+        )
+        
+        return {
+            "verified": verified,
+            "message_hash": stored_hash,
+            "computed_hash": expected_hash,
+            "message": "Message integrity verified" if verified else "Hash mismatch - message may have been modified",
+            "status": status_msg,
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Message integrity verification failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Verification failed: {str(e)}",
         )
 
 
@@ -277,6 +402,7 @@ async def get_room_messages(
                 sender_id=msg.sender_id,
                 content=msg.content,
                 content_encrypted=msg.content_encrypted,
+                message_hash=msg.message_hash,
                 created_at=msg.created_at,
                 updated_at=msg.updated_at,
             )

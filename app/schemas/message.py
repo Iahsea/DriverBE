@@ -31,6 +31,7 @@ class MessageResponse(BaseModel):
     sender_name: Optional[str] = Field(None, description="Tên người gửi (optional)")
     content: str = Field(..., description="Nội dung tin nhắn")
     content_encrypted: Optional[str] = Field(None, description="Nội dung mã hóa")
+    message_hash: Optional[str] = Field(None, description="MD5 hash của plaintext (32 hex chars) - integrity verification")
     is_read: bool = Field(False, description="Tin nhắn đã được đọc hay chưa")
     read_at: Optional[datetime] = Field(None, description="Thời gian đọc tin nhắn")
     created_at: datetime = Field(..., description="Thời gian gửi")
@@ -101,6 +102,7 @@ class DecryptMessageResponse(BaseModel):
     room_id: str = Field(..., description="Room ID")
     sender_id: str = Field(..., description="Sender User ID")
     content_plaintext: str = Field(..., description="Decrypted plaintext content")
+    message_hash: Optional[str] = Field(None, description="MD5 hash của plaintext (để verify toàn vẹn)")
     created_at: datetime = Field(..., description="Thời gian gửi")
     message: str = Field("Message decrypted successfully", description="Status message")
     

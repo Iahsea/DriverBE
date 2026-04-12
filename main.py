@@ -70,7 +70,19 @@ def run_migrations():
                 else:
                     logger.warning(f"⚠️ Could not add read_at column: {e}")
             
-            # Try to add index
+            # Try to add message_hash column (MD5 hash for integrity verification)
+            try:
+                connection.execute(text(
+                    "ALTER TABLE messages ADD COLUMN message_hash VARCHAR(64) NULL"
+                ))
+                logger.info("✅ Added 'message_hash' column to messages table")
+            except Exception as e:
+                if "Duplicate column" in str(e) or "already exists" in str(e):
+                    logger.debug("✓ 'message_hash' column already exists")
+                else:
+                    logger.warning(f"⚠️ Could not add message_hash column: {e}")
+            
+            # Try to add index on is_read
             try:
                 connection.execute(text(
                     "CREATE INDEX idx_messages_is_read ON messages(is_read)"
@@ -329,29 +341,34 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     
                     # ===== 6b. Backend calls Kernel Driver to encrypt =====
                     try:
+                        # Call crypto_bridge to hash message using Driver (IOCTL_HASH_MD5)
+                        # Returns MD5 hash (32 hex chars)
+                        message_hash = await crypto_bridge.hash_message_content(content)
+                        
                         # Call crypto_bridge to encrypt message using Driver (IOCTL_ENCRYPT_AES)
                         # Returns encrypted ciphertext (base64 encoded with IV prepended)
                         content_encrypted = await crypto_bridge.encrypt_message_payload(content)
                     except Exception as e:
-                        logger.error(f"Backend Driver encrypt failed: {e}")
+                        logger.error(f"Backend Driver encrypt/hash failed: {e}")
                         await connection_manager.send_personal_message(
                             room_id_norm,
                             user_id_norm,
                             {
                                 "type": "error",
-                                "message": "Backend encryption failed",
+                                "message": "Backend encryption/hashing failed",
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                             },
                         )
                         continue
                     
-                    # ===== 7. Save message to database (BOTH plaintext + encrypted) =====
+                    # ===== 7. Save message to database (plaintext + encrypted + hash) =====
                     message = Message(
                         id=None,  # Auto-generate UUID
                         room_id=room_id_norm,
                         sender_id=user_id_norm,
                         content=content,  # Plaintext for display/logging
                         content_encrypted=content_encrypted,  # Encrypted by Driver
+                        message_hash=message_hash,  # MD5 hash by Driver
                         created_at=datetime.utcnow(),
                         updated_at=datetime.utcnow(),
                     )
@@ -360,8 +377,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     db.commit()
                     db.refresh(message)
                     
-                    # ===== 8. Broadcast encrypted message to room members =====
-                    # Clients receive encrypted and can decrypt using Web Crypto API
+                    # ===== 8. Broadcast encrypted message + hash to room members =====
+                    # Clients receive encrypted, hash and can decrypt/verify using Web Crypto API
                     await connection_manager.broadcast_to_room(room_id_norm, {
                         "type": "message",
                         "id": message.id,
@@ -370,6 +387,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                         "sender_name": user.username,
                         "content": content,  # For fallback if client can't decrypt
                         "content_encrypted": message.content_encrypted,  # Encrypted by Driver
+                        "message_hash": message.message_hash,  # MD5 hash by Driver for integrity verification
                         "created_at": message.created_at.isoformat(),
                         "updated_at": message.updated_at.isoformat(),
                         "timestamp": datetime.now(timezone.utc).isoformat(),

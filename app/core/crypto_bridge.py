@@ -258,6 +258,66 @@ class CryptoBridge:
             password,
         )
 
+    async def hash_message_content(self, content: str) -> str:
+        """
+        Hash message content dùng Kernel Driver (MD5) - Integrity Verification.
+        
+        Tương tự như hash_password_with_driver() nhưng cho message plaintext.
+        Dùng Driver Windows/Linux để tính MD5 hash - detect tampering.
+        
+        Args:
+            content: Plaintext message content
+        
+        Returns:
+            MD5 hash (32 hex characters) - e.g., "a1b2c3d4e5f6..."
+        
+        Process:
+            1. Encode content thành bytes (UTF-8)
+            2. Gửi xuống Driver via IOCTL (Windows DLL / Linux device)
+            3. Driver tính MD5 hash
+            4. Driver trả về 32 bytes hash
+            5. Convert thành hex string
+            6. Return hash
+        
+        Use case - Integrity Verification:
+            Client1 sends: "Hello Client2"
+                ↓
+            Backend:
+              1. hash = MD5("Hello Client2") = "a1b2c3d4..." via driver
+              2. encrypted = AES_encrypt("Hello Client2")
+              3. DB save: {content, content_encrypted, message_hash}
+              4. WebSocket broadcast: {content_encrypted, message_hash}
+                ↓
+            Client2 receives encrypted message + hash
+              1. plaintext = AES_decrypt(content_encrypted)
+              2. computed_hash = MD5(plaintext) = "a1b2c3d4..."
+              3. Verify: computed_hash === message_hash ✓ (toàn vẹn)
+                                                      ✗ (bị tampering)
+        """
+        loop = asyncio.get_event_loop()
+        
+        # Try driver first (Windows DLL hoặc Linux ioctl)
+        if self.driver_available:
+            try:
+                content_bytes = content.encode("utf-8")
+                hash_result = await loop.run_in_executor(
+                    self.executor,
+                    self._hash_via_driver,
+                    content_bytes,
+                )
+                logger.info(f"✓ Message hash via driver: {hash_result[:16]}...")
+                return hash_result
+            except Exception as e:
+                logger.warning(f"Driver message hash failed: {e}, falling back to mock")
+        
+        # Fallback sang mock (hashlib) nếu driver unavailable
+        logger.info("⚠️  Using mock MD5 hash (driver not available)")
+        return await loop.run_in_executor(
+            self.executor,
+            self._hash_mock,
+            content,
+        )
+
     async def encrypt_aes_with_driver(
         self,
         plaintext: bytes,

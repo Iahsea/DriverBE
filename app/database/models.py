@@ -146,6 +146,7 @@ class Message(Base):
         sender_id: UUID của người gửi
         content: Nội dung tin nhắn (plaintext - for display/logging)
         content_encrypted: Nội dung mã hóa (AES-256-CBC via Kernel Driver)
+        message_hash: MD5 hash của plaintext (32 hex chars) - integrity verification via Kernel Driver
         is_read: Tin nhắn đã được đọc hay chưa
         read_at: Thời gian đọc tin nhắn
         created_at: Thời gian gửi
@@ -158,6 +159,7 @@ class Message(Base):
     sender_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     content = Column(Text, nullable=False)  # Plaintext message (for display/broadcast)
     content_encrypted = Column(Text, nullable=False)  # AES-256-CBC encrypted via Kernel Driver
+    message_hash = Column(String(64), nullable=True)  # MD5 hash (32 hex chars) - integrity verification via Driver
     is_read = Column(Boolean, default=False, nullable=False, index=True)
     read_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
