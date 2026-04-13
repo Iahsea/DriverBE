@@ -35,6 +35,8 @@ import {
 import { decryptMessage } from '../api/messages.js'
 import { API_BASE_URL } from '../api/client.js'
 import { useAuth } from '../store/auth.jsx'
+import { messageDebugger } from '../utils/messageDebugger.js'
+import { verifyMessageIntegrity, performFullVerification } from '../utils/messageIntegrity.js'
 import '../styles/ChatPage.css'
 
 function normalizeId(value) {
@@ -96,27 +98,65 @@ function ChatPage() {
 
   /**
    * Giải mã message từ backend API
+   * Backend trả plaintext + message_hash
    * Cache kết quả để tránh gọi API lặp lại
    */
   const decryptMessageContent = async (messageId, contentEncrypted) => {
     // Check cache first
     if (decryptedCacheRef.current.has(messageId)) {
-      return decryptedCacheRef.current.get(messageId)
+      const cached = decryptedCacheRef.current.get(messageId)
+      messageDebugger.logFrontendDisplay(messageId, cached.plaintext)
+      return cached
     }
 
     try {
+      messageDebugger.logFrontendDecryptRequest(messageId)
       const response = await decryptMessage(messageId)
       const plaintext = response.content_plaintext || contentEncrypted
+      const messageHash = response.message_hash // API trả hash
       
-      // Cache the result
-      decryptedCacheRef.current.set(messageId, plaintext)
-      console.log('✅ Message decrypted:', messageId)
+      const decrypted = {
+        plaintext,
+        message_hash: messageHash,
+        verification_timestamp: new Date().toISOString(),
+      }
       
-      return plaintext
+      // Cache the result (chưa verify lúc này)
+      decryptedCacheRef.current.set(messageId, decrypted)
+      messageDebugger.logFrontendDecryptResponse(messageId, plaintext)
+      messageDebugger.logFrontendDisplay(messageId, plaintext)
+      
+      return decrypted
     } catch (error) {
-      console.error('❌ Decryption failed for message:', messageId, error)
+      messageDebugger.logError('DECRYPT', messageId, error)
       // Return encrypted content as fallback
-      return contentEncrypted
+      return {
+        plaintext: contentEncrypted,
+        message_hash: null,
+        error: error.message,
+      }
+    }
+  }
+
+  /**
+   * Verify message integrity bằng cách gọi backend API
+   * Backend sẽ tính MD5(plaintext) và so sánh với message_hash
+   */
+  const verifyMessageIntegrity = async (messageId, plaintext) => {
+    try {
+      const verification = await performFullVerification(
+        { id: messageId, content_decrypted: plaintext },
+        token,
+        true // call backend verify
+      )
+      return verification
+    } catch (error) {
+      console.error('❌ Verification error:', error)
+      return {
+        verified: null,
+        integrity_status: 'error',
+        error: error.message,
+      }
     }
   }
 
@@ -158,24 +198,49 @@ function ChatPage() {
       }
       const data = await getRoomMessages(roomId, 0, 30)
       const batch = data.messages || []
-      setMessages(batch)
+      
+      // Filter out any messages that might already be in state (from WebSocket)
+      setMessages((prev) => {
+        const existingIds = new Set(prev.map((m) => m.id))
+        const newMessages = batch.filter((msg) => !existingIds.has(msg.id))
+        // If there are existing messages (from WebSocket), prepend new ones
+        return newMessages.length > 0 ? [...newMessages, ...prev] : batch
+      })
       setEvents([])
       
       // Decrypt messages with encrypted content
       batch.forEach((msg) => {
         if (msg.content_encrypted && msg.id) {
-          decryptMessageContent(msg.id, msg.content_encrypted).then((decryptedContent) => {
+          decryptMessageContent(msg.id, msg.content_encrypted).then((decrypted) => {
             setMessages((prev) => {
               const idx = prev.findIndex((m) => m.id === msg.id)
               if (idx >= 0) {
                 const updated = [...prev]
                 updated[idx] = {
                   ...updated[idx],
-                  content_decrypted: decryptedContent,
+                  content_decrypted: decrypted.plaintext,
+                  message_hash: decrypted.message_hash,
                 }
                 return updated
               }
               return prev
+            })
+            
+            // Call verify API
+            verifyMessageIntegrity(msg.id, decrypted.plaintext).then((verification) => {
+              setMessages((prev) => {
+                const idx = prev.findIndex((m) => m.id === msg.id)
+                if (idx >= 0) {
+                  const updated = [...prev]
+                  updated[idx] = {
+                    ...updated[idx],
+                    message_verified: verification.verified,
+                    verification_timestamp: verification.timestamp,
+                  }
+                  return updated
+                }
+                return prev
+              })
             })
           })
         }
@@ -213,23 +278,46 @@ function ChatPage() {
         setHasMoreMessages(false)
         hasMoreRef.current = false
       } else {
-        setMessages((prev) => [...batch, ...prev])
+        setMessages((prev) => {
+          // Filter out messages that already exist to avoid duplicates
+          const existingIds = new Set(prev.map((m) => m.id))
+          const newMessages = batch.filter((msg) => !existingIds.has(msg.id))
+          return [...newMessages, ...prev]
+        })
         
         // Decrypt messages with encrypted content
         batch.forEach((msg) => {
           if (msg.content_encrypted && msg.id) {
-            decryptMessageContent(msg.id, msg.content_encrypted).then((decryptedContent) => {
+            decryptMessageContent(msg.id, msg.content_encrypted).then((decrypted) => {
               setMessages((prev) => {
                 const idx = prev.findIndex((m) => m.id === msg.id)
                 if (idx >= 0) {
                   const updated = [...prev]
                   updated[idx] = {
                     ...updated[idx],
-                    content_decrypted: decryptedContent,
+                    content_decrypted: decrypted.plaintext,
+                    message_hash: decrypted.message_hash,
                   }
                   return updated
                 }
                 return prev
+              })
+              
+              // Call verify API
+              verifyMessageIntegrity(msg.id, decrypted.plaintext).then((verification) => {
+                setMessages((prev) => {
+                  const idx = prev.findIndex((m) => m.id === msg.id)
+                  if (idx >= 0) {
+                    const updated = [...prev]
+                    updated[idx] = {
+                      ...updated[idx],
+                      message_verified: verification.verified,
+                      verification_timestamp: verification.timestamp,
+                    }
+                    return updated
+                  }
+                  return prev
+                })
               })
             })
           }
@@ -298,9 +386,19 @@ function ChatPage() {
           
           console.log('📥 WebSocket message received:', data.type, '| room:', roomId)
 
+          // [DEBUG] Phase 12: Frontend receives from WebSocket
+          if (data.type === 'message' && data.id) {
+            messageDebugger.logFrontendReceive(
+              data.id,
+              data.room_id || roomId,
+              data.sender_name,
+              data.content_encrypted || ''
+            )
+          }
+
           // Update room list with new message preview and timestamp
           if (data.type === 'message' && data.id) {
-            const displayContent = data.content
+            const displayContent = '[encrypted]'  // Always show encrypted until decrypted
             console.log('🔄 Updating room list with new message:', displayContent)
             setRooms((prevRooms) => {
               const updatedRooms = prevRooms.map((r) => {
@@ -337,7 +435,7 @@ function ChatPage() {
             if (data.type === 'system') {
               const isDuplicate = events.some(
                 (e) =>
-                  e.content === data.content &&
+                  e.id === data.id &&
                   e.sender_id === data.sender_id &&
                   new Date().getTime() - new Date(e.created_at || e.timestamp).getTime() < 5000
               )
@@ -347,54 +445,68 @@ function ChatPage() {
             } else if (data.type === 'message' && data.id) {
               console.log('📨 Adding message:', data.id, 'from:', data.sender_name)
               
-              // Decrypt message if it has encrypted content, then add to state
+              // [DEBUG] Phase 13: Frontend adds to state
+              messageDebugger.logFrontendAddToState(data.id)
+              
+              // Check if message already exists
+              setMessages((prev) => {
+                const existingIndex = prev.findIndex((m) => m.id === data.id)
+                
+                if (existingIndex >= 0) {
+                  // Message already exists, don't add duplicate
+                  console.log('⚠️ Message already exists, skipping')
+                  return prev
+                }
+                
+                // Add message immediately (optimistically)
+                if (normalizeId(data.sender_id) === normalizeId(userIdRef.current)) {
+                  // Own message: replace temp message and add real one
+                  const filteredMessages = prev.filter((m) => !m.id.startsWith('temp-'))
+                  return [...filteredMessages, data]
+                }
+                
+                // Other user message: add to list
+                return [...prev, data]
+              })
+              
+              // If message is encrypted, decrypt it and update
               if (data.content_encrypted) {
-                decryptMessageContent(data.id, data.content_encrypted).then((decryptedContent) => {
+                decryptMessageContent(data.id, data.content_encrypted).then((decrypted) => {
                   setMessages((prev) => {
-                    // Check if this message already exists
-                    const existingIndex = prev.findIndex((m) => m.id === data.id)
-                    
-                    if (existingIndex >= 0) {
-                      // Update existing message with decrypted content
+                    // Update the message with decrypted content
+                    const idx = prev.findIndex((m) => m.id === data.id)
+                    if (idx >= 0) {
                       const updated = [...prev]
-                      updated[existingIndex] = {
-                        ...updated[existingIndex],
-                        content_decrypted: decryptedContent,
+                      updated[idx] = {
+                        ...updated[idx],
+                        content_decrypted: decrypted.plaintext,
+                        message_hash: decrypted.message_hash,
                       }
                       return updated
                     }
-                    
-                    // Add as new message
-                    if (normalizeId(data.sender_id) === normalizeId(userIdRef.current)) {
-                      const filteredMessages = prev.filter((m) => !m.id.startsWith('temp-'))
-                      return [...filteredMessages, { ...data, content_decrypted: decryptedContent }]
-                    }
-                    
-                    return [...prev, { ...data, content_decrypted: decryptedContent }]
-                  })
-                  setTimeout(scrollToBottom, 50)
-                })
-              } else {
-                // No encryption, add directly
-                setMessages((prev) => {
-                  const existingIndex = prev.findIndex((m) => m.id === data.id)
-                  
-                  if (existingIndex >= 0) {
-                    console.log('⚠️ Message already exists, skipping')
                     return prev
-                  }
+                  })
                   
-                  if (normalizeId(data.sender_id) === normalizeId(userIdRef.current)) {
-                    console.log('✅ Own message, replacing temp message')
-                    const filteredMessages = prev.filter((m) => !m.id.startsWith('temp-'))
-                    return [...filteredMessages, data]
-                  }
-                  
-                  console.log('✅ Other user message, adding to list')
-                  return [...prev, data]
+                  // Call verify API
+                  verifyMessageIntegrity(data.id, decrypted.plaintext).then((verification) => {
+                    setMessages((prev) => {
+                      const idx = prev.findIndex((m) => m.id === data.id)
+                      if (idx >= 0) {
+                        const updated = [...prev]
+                        updated[idx] = {
+                          ...updated[idx],
+                          message_verified: verification.verified,
+                          verification_timestamp: verification.timestamp,
+                        }
+                        return updated
+                      }
+                      return prev
+                    })
+                  })
                 })
-                setTimeout(scrollToBottom, 50)
               }
+              
+              setTimeout(scrollToBottom, 50)
             }
           } else {
             console.log('⏭️ Message for inactive room:', roomId, 'current active:', activeRoomRef.current?.id)
@@ -421,10 +533,14 @@ function ChatPage() {
 
     const messageText = draft.trim()
     const tempId = `temp-${Date.now()}-${Math.random()}` // Temporary ID for optimistic update
+    const messageId = tempId
+
+    // [DEBUG] Phase 1: User sends message
+    messageDebugger.logSend(messageId, messageText, activeRoom.id, user?.id)
 
     // Add message locally immediately (optimistic update)
     const optimisticMessage = {
-      id: tempId,
+      id: messageId,
       room_id: activeRoom.id,
       sender_id: normalizeId(user?.id),
       sender_name: user?.username,
@@ -446,16 +562,21 @@ function ChatPage() {
     try {
       const ws = wsConnectionsRef.current.get(activeRoom.id)
       if (ws?.readyState === WebSocket.OPEN) {
+        // [DEBUG] Phase 3: WebSocket send
+        messageDebugger.logWebSocketSend(messageId, activeRoom.id)
         ws.send(JSON.stringify(messageData))
+        messageDebugger.logWebSocketSendSuccess(messageId)
       } else {
+        messageDebugger.logWebSocketSendFailed(messageId, new Error('Connection not open'))
         message.error('Connection lost')
         // Remove optimistic message if failed to send
-        setMessages((prev) => prev.filter((m) => m.id !== tempId))
+        setMessages((prev) => prev.filter((m) => m.id !== messageId))
       }
     } catch (error) {
+      messageDebugger.logError('WEBSOCKET', messageId, error)
       message.error('Failed to send message')
       // Remove optimistic message if error
-      setMessages((prev) => prev.filter((m) => m.id !== tempId))
+      setMessages((prev) => prev.filter((m) => m.id !== messageId))
     }
   }
 
@@ -721,8 +842,20 @@ function ChatPage() {
                       )}
                       <div className={`message-bubble ${isSelf ? 'sent' : 'received'}`}>
                         <div className="message-text">
-                          {item.content_decrypted || item.content}
+                          {item.content_decrypted || <em style={{color: '#999'}}>Decrypting...</em>}
                         </div>
+                        {item.message_verified === true && (
+                          <div className="message-verification" style={{fontSize: '11px', marginTop: '4px', color: '#999'}}>
+                            <span title="Message integrity verified">🔒 Verified</span>
+                          </div>
+                        )}
+                        {item.message_verified === false && (
+                          <div className="message-verification" style={{fontSize: '11px', marginTop: '4px', color: '#ff4d4f'}}>
+                            <span title="Message verification FAILED - possible tampering!">
+                              ⚠️ Tampered
+                            </span>
+                          </div>
+                        )}
                         <div className="message-time">
                           {new Date(item.created_at || item.timestamp).toLocaleTimeString([], {
                             hour: '2-digit',

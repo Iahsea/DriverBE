@@ -202,7 +202,19 @@ async def decrypt_message(
     
     # Decrypt the message using crypto_bridge
     try:
+        # [DEBUG] Phase 15: Backend receives decrypt request
+        logger.info(f"[🔑 PHASE 15] Backend receives decrypt request | message_id: {message_id_norm[:8]}... | user: {current_user.username}")
+        
+        # [DEBUG] Phase 16: Backend decrypts
+        logger.info(f"[🔓 PHASE 16] Starting decryption | encrypted_len: {len(message.content_encrypted)} | encrypted_start: {message.content_encrypted[:50]}")
+        
         plaintext = await crypto_bridge.decrypt_message_payload(message.content_encrypted)
+        
+        # [DEBUG] Phase 17: Backend decrypt success
+        logger.info(f"[✅ PHASE 17] Decryption success | plaintext_len: {len(plaintext)} | plaintext: {plaintext[:50]}")
+        
+        # [DEBUG] Phase 18: Backend sends decrypt response
+        logger.info(f"[📤 PHASE 18] Sending decrypt response | message_id: {message_id_norm[:8]}... | plaintext: {plaintext[:50]}")
         
         logger.info(f"✓ Message {message_id_norm[:8]}... decrypted successfully for user {current_user.username}")
         
