@@ -32,7 +32,6 @@ import {
   removeRoomMember,
   deleteRoom,
 } from '../api/rooms.js'
-import { listFriends } from '../api/friends.js'
 import { decryptMessage } from '../api/messages.js'
 import { API_BASE_URL } from '../api/client.js'
 import { useAuth } from '../store/auth.jsx'
@@ -67,9 +66,6 @@ function ChatPage() {
   const [memberModalOpen, setMemberModalOpen] = useState(false)
   const [memberForm, setMemberForm] = useState({ userId: '', role: 'member' })
   const [searchTerm, setSearchTerm] = useState('')
-  const [friends, setFriends] = useState([]) // All friends
-  const [searchMember, setSearchMember] = useState('') // Search query for add member
-  const [loadingFriends, setLoadingFriends] = useState(false)
   
   // ====================
   // REFS - Avoid Closure Issues
@@ -106,69 +102,24 @@ function ChatPage() {
     room.name?.toLowerCase().includes(searchTerm.toLowerCase())
   )
 
-  // ⭐ Filter friends for add member dropdown
-  const filteredFriends = friends.filter((friend) => {
-    const searchLower = searchMember.toLowerCase()
-    return (
-      friend.username?.toLowerCase().includes(searchLower) ||
-      friend.email?.toLowerCase().includes(searchLower) ||
-      friend.user_id?.toLowerCase().includes(searchLower)
-    )
-  })
-
   // ⭐ KEY FIX: Filter messages by CURRENT room only
   const currentRoomMessages = activeRoom
     ? messages.filter((msg) => msg.room_id === activeRoom.id)
     : []
-
-  // ⭐ DEBUG: Check if currentRoomMessages has duplicates
-  if (currentRoomMessages.length > 0) {
-    const msgIds = currentRoomMessages.map((m) => m.id)
-    const hasDups = new Set(msgIds).size !== msgIds.length
-    if (hasDups) {
-      const dups = msgIds.filter((id, idx) => msgIds.indexOf(id) !== idx)
-      console.error(`🔴 DUPLICATES IN currentRoomMessages: ${dups.join(', ')} | total: ${currentRoomMessages.length}, unique: ${new Set(msgIds).size}`)
-    }
-  }
-
-  // ⭐ DEBUG: Check global messages state for duplicates
-  if (messages.length > 0 && activeRoom) {
-    const allIds = messages.map((m) => m.id)
-    const duplicates = allIds.filter((id, idx) => allIds.indexOf(id) !== idx)
-    if (duplicates.length > 0) {
-      const uniqueDups = [...new Set(duplicates)]
-      console.error(`🔴 DUPLICATES IN GLOBAL MESSAGES: ${uniqueDups.join(', ')} (${uniqueDups.length} unique IDs)`)
-      uniqueDups.forEach((id) => {
-        const copies = messages.filter((m) => m.id === id)
-        console.log(`  ${id}: ${copies.length} copies in rooms: ${copies.map(c => c.room_id).join(',')}`)
-      })
-    }
-  }
 
   // ⭐ KEY FIX: Filter events by CURRENT room only
   const currentRoomEvents = activeRoom
     ? events.filter((evt) => evt.room_id === activeRoom.id)
     : []
 
-  // ⭐ KEY FIX: combinedFeed with room filtering AND deduplication
-  const combinedFeedRaw = [
+  // ⭐ KEY FIX: combinedFeed with room filtering
+  const combinedFeed = [
     ...currentRoomEvents.map((e) => ({ ...e, type: 'system' })),
     ...currentRoomMessages,
   ].sort((a, b) => {
     const timeA = new Date(a.created_at || a.timestamp || 0).getTime()
     const timeB = new Date(b.created_at || b.timestamp || 0).getTime()
     return timeA - timeB
-  })
-
-  // ⭐ DEDUPLICATE by ID to prevent 2x display
-  const seenIds = new Set()
-  const combinedFeed = combinedFeedRaw.filter((item) => {
-    if (seenIds.has(item.id)) {
-      console.warn(`🔴 DUPLICATE MESSAGE ID: ${item.id}`, item)
-      return false
-    }
-    seenIds.add(item.id)
-    return true
   })
 
   // ====================
@@ -389,17 +340,12 @@ function ChatPage() {
         return
       }
 
+      // RESET: Clear messages for this room
+      setMessages((prev) => prev.filter((msg) => msg.room_id !== roomId))
+      setEvents((prev) => prev.filter((evt) => evt.room_id !== roomId))
+
       const data = await getRoomMessages(roomId, 0, 30)
       const batch = data.messages || []
-
-      console.log(`📝 [LOAD] Fetched ${batch.length} messages for room ${roomId}`)
-
-      // Check for duplicates in batch
-      const batchIds = batch.map((m) => m.id)
-      const batchDuplicates = batchIds.filter((id, idx) => batchIds.indexOf(id) !== idx)
-      if (batchDuplicates.length > 0) {
-        console.error(`🔴 [LOAD] Batch contains duplicate IDs:`, batchDuplicates)
-      }
 
       // ⭐ Room check - abort if room changed
       if (activeRoomIdRef.current !== roomId) {
@@ -407,26 +353,11 @@ function ChatPage() {
         return
       }
 
-      // ⭐ SINGLE setMessages call - clear this room + add new messages
-      setMessages((prev) => {
-        const newMessages = [
-          ...prev.filter((msg) => msg.room_id !== roomId), // Keep other rooms, clear this room
-          ...batch.map((msg) => ({ ...msg, room_id: roomId })), // Add fresh batch with room_id
-        ]
-
-        const totalForRoom = newMessages.filter((m) => m.room_id === roomId).length
-        const newIds = newMessages.map((m) => m.id)
-        const duplicates = newIds.filter((id, idx) => newIds.indexOf(id) !== idx)
-        if (duplicates.length > 0) {
-          console.error(`🔴 [LOAD] After setMessages, duplicates exist in state:`, duplicates)
-        }
-        console.log(`📝 [LOAD] After update: ${totalForRoom} messages for room ${roomId}, total state: ${newMessages.length}`)
-
-        return newMessages
-      })
-
-      // ⭐ Clear events for this room (do NOT combine with setMessages to avoid race)
-      setEvents((prev) => prev.filter((evt) => evt.room_id !== roomId))
+      // Set raw messages
+      setMessages((prev) => [
+        ...prev.filter((msg) => msg.room_id !== roomId), // Keep other rooms
+        ...batch.map((msg) => ({ ...msg, room_id: roomId })), // Ensure room_id set
+      ])
 
       const total = typeof data.total === 'number' ? data.total : batch.length
       const hasMore = batch.length < total
@@ -738,7 +669,6 @@ function ChatPage() {
       sender_id: normalizeId(user?.id),
       sender_name: user?.username,
       content: messageText,
-      content_decrypted: messageText, // ⭐ Set decrypted content immediately
       created_at: new Date().toISOString(),
       timestamp: new Date().toISOString(),
       is_read: false,
@@ -858,33 +788,6 @@ function ChatPage() {
     userIdRef.current = user?.id
   }, [user?.id])
 
-  // ⭐ Load friends when add member modal opens
-  useEffect(() => {
-    if (memberModalOpen) {
-      console.log('📂 Add member modal opened, loading friends...')
-      const loadFriendsData = async () => {
-        try {
-          setLoadingFriends(true)
-          const data = await listFriends()
-          console.log('✅ Friends loaded:', data)
-          const friendsList = Array.isArray(data) ? data : data?.data || []
-          setFriends(friendsList)
-          console.log(`✅ Set ${friendsList.length} friends`)
-        } catch (error) {
-          console.error('❌ Failed to load friends:', error)
-          setFriends([])
-        } finally {
-          setLoadingFriends(false)
-        }
-      }
-      loadFriendsData()
-    } else {
-      // Clear search and form when modal closes
-      setSearchMember('')
-      setMemberForm({ userId: '', role: 'member' })
-    }
-  }, [memberModalOpen])
-
   useEffect(() => {
     const container = messagesContainerRef.current
     const sentinel = sentinelRef.current
@@ -912,16 +815,7 @@ function ChatPage() {
       <aside className="messenger-sidebar">
         <div className="sidebar-top">
           <h2 className="sidebar-title">Chats</h2>
-          <Button
-            type="text"
-            icon={<PlusOutlined />}
-            className="compose-btn"
-            onClick={() => {
-              setModalOpen(true)
-              // ⭐ Clear messages when opening create room modal
-              setMessages([])
-            }}
-          />
+          <Button type="text" icon={<PlusOutlined />} className="compose-btn" onClick={() => setModalOpen(true)} />
         </div>
 
         <Input
@@ -977,16 +871,7 @@ function ChatPage() {
             <div className="empty-icon">💬</div>
             <h2>Select a conversation</h2>
             <p>No active chat selected</p>
-            <Button
-              type="primary"
-              size="large"
-              icon={<PlusOutlined />}
-              onClick={() => {
-                setModalOpen(true)
-                // ⭐ Clear messages when opening create room modal
-                setMessages([])
-              }}
-            >
+            <Button type="primary" size="large" icon={<PlusOutlined />} onClick={() => setModalOpen(true)}>
               Start New Chat
             </Button>
           </div>
@@ -1030,6 +915,11 @@ function ChatPage() {
                   <div className={`messages-loader ${isLoadingMore ? '' : 'is-hidden'}`}>
                     Loading older messages...
                   </div>
+                </div>
+              )}
+              {isLoadingMore && (
+                <div className="system-message-wrapper">
+                  <div className="system-msg">Loading more messages...</div>
                 </div>
               )}
               {combinedFeed.length === 0 ? (
@@ -1115,18 +1005,13 @@ function ChatPage() {
         )}
       </section>
 
-      {activeRoom && (
+      {activeRoom && members.length > 0 && (
         <aside className="messenger-info">
           <div className="info-header">
             <h3>Members ({members.length})</h3>
           </div>
           <div className="members-container">
-            {members.length === 0 ? (
-              <div style={{ padding: '16px', textAlign: 'center', color: '#999' }}>
-                No members yet
-              </div>
-            ) : (
-              members.map((member) => (
+            {members.map((member) => (
               <div className="member-row" key={member.id}>
                 <Avatar size={40} style={{ backgroundColor: '#1890ff' }}>
                   {member.username?.slice(0, 1).toUpperCase()}
@@ -1153,8 +1038,7 @@ function ChatPage() {
                   />
                 )}
               </div>
-            ))
-            )}
+            ))}
           </div>
 
           <div className="info-actions">
@@ -1221,7 +1105,7 @@ function ChatPage() {
         open={memberModalOpen}
         onOk={async () => {
           if (!memberForm.userId) {
-            antMessage.warning('Please select a member')
+            antMessage.warning('User ID required')
             return
           }
           try {
@@ -1231,7 +1115,6 @@ function ChatPage() {
             })
             setMemberModalOpen(false)
             setMemberForm({ userId: '', role: 'member' })
-            setSearchMember('')
             await loadRoomDetails(activeRoom.id)
             antMessage.success('Member added')
           } catch (error) {
@@ -1241,91 +1124,15 @@ function ChatPage() {
         onCancel={() => {
           setMemberModalOpen(false)
           setMemberForm({ userId: '', role: 'member' })
-          setSearchMember('')
         }}
-        width={500}
-        styles={{ body: { minHeight: '250px' } }}
+        width={400}
       >
         <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          {/* ⭐ Search friends */}
-          <div>
-            <label style={{ display: 'block', marginBottom: '4px', fontWeight: 500 }}>
-              Find members by name or email:
-            </label>
-            <Input
-              placeholder="Search by name, email or ID..."
-              prefix={<SearchOutlined />}
-              value={searchMember}
-              onChange={(e) => setSearchMember(e.target.value)}
-            />
-          </div>
-
-          {/* ⭐ Friends dropdown list with scroll */}
-          <div
-            style={{
-              border: '1px solid #d9d9d9',
-              borderRadius: '4px',
-              minHeight: '150px',
-              maxHeight: '300px',
-              overflowY: 'auto',
-              backgroundColor: '#fafafa',
-            }}
-          >
-            {loadingFriends ? (
-              <div style={{ padding: '12px', textAlign: 'center' }}>
-                <Spin size="small" />
-              </div>
-            ) : filteredFriends.length === 0 ? (
-              <div style={{ padding: '12px', textAlign: 'center', color: '#999' }}>
-                {friends.length === 0 ? 'No friends yet' : 'No friends matching search'}
-              </div>
-            ) : (
-              filteredFriends.map((friend) => {
-                const isSelected = memberForm.userId === friend.user_id
-                return (
-                  <div
-                    key={friend.user_id}
-                    onClick={() =>
-                      setMemberForm({ ...memberForm, userId: friend.user_id })
-                    }
-                    style={{
-                      padding: '10px 12px',
-                      cursor: 'pointer',
-                      backgroundColor: isSelected ? '#e6f7ff' : 'transparent',
-                      borderBottom: '1px solid #f0f0f0',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '8px',
-                      transition: 'background-color 0.2s',
-                    }}
-                    onMouseEnter={(e) => {
-                      if (!isSelected) e.target.style.backgroundColor = '#f5f5f5'
-                    }}
-                    onMouseLeave={(e) => {
-                      if (!isSelected) e.target.style.backgroundColor = 'transparent'
-                    }}
-                  >
-                    <Avatar size={32} style={{ backgroundColor: '#1890ff' }}>
-                      {friend.username?.slice(0, 1).toUpperCase()}
-                    </Avatar>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontWeight: isSelected ? 600 : 400 }}>
-                        {friend.username}
-                      </div>
-                      <div style={{ fontSize: '12px', color: '#999' }}>
-                        {friend.email}
-                      </div>
-                    </div>
-                    {isSelected && (
-                      <div style={{ color: '#1890ff', fontSize: '16px' }}>✓</div>
-                    )}
-                  </div>
-                )
-              })
-            )}
-          </div>
-
-          {/* ⭐ Role selector */}
+          <Input
+            placeholder="User ID"
+            value={memberForm.userId}
+            onChange={(e) => setMemberForm({ ...memberForm, userId: e.target.value })}
+          />
           <select
             value={memberForm.role}
             onChange={(e) => setMemberForm({ ...memberForm, role: e.target.value })}

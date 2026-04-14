@@ -12,11 +12,12 @@ import {
 } from '@ant-design/icons'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../store/auth.jsx'
+import NotificationPanel from './NotificationPanel.jsx'
 
 const { Sider, Header, Content } = Layout
 
 function AppShell({ activeKey, children }) {
-  const { user, logout, notifications } = useAuth()
+  const { user, logout, unreadCount } = useAuth()
   const initial = user?.username?.slice(0, 1)?.toUpperCase() || 'U'
   const [drawerOpen, setDrawerOpen] = useState(false)
 
@@ -85,8 +86,12 @@ function AppShell({ activeKey, children }) {
             />
           </div>
           <div className="header-right">
-            <Badge count={notifications.length} size="small" offset={[4, -2]}>
-              <BellOutlined className="header-icon" onClick={() => setDrawerOpen(true)} />
+            <Badge count={unreadCount} size="small" offset={[-4, 4]} color="#ff4d4f">
+              <BellOutlined
+                className="header-icon"
+                onClick={() => setDrawerOpen(true)}
+                style={{ fontSize: '18px', cursor: 'pointer' }}
+              />
             </Badge>
             <Avatar className="header-avatar" size={32}>
               {initial}
@@ -97,20 +102,15 @@ function AppShell({ activeKey, children }) {
       </Layout>
 
       <Drawer
-        title="Notifications"
-        open={drawerOpen}
+        title={null}
+        placement="right"
         onClose={() => setDrawerOpen(false)}
+        open={drawerOpen}
+        width={360}
+        bodyStyle={{ padding: 0, display: 'flex', flexDirection: 'column' }}
+        headerStyle={{ display: 'none' }}
       >
-        {notifications.length === 0 && (
-          <div className="empty-state">No notifications yet.</div>
-        )}
-        {notifications.map((item, index) => (
-          <div className="notification-item" key={`${item.type}-${item.timestamp || index}`}>
-            <div className="notification-type">{item.type}</div>
-            <div className="notification-message">{item.message || 'Update received'}</div>
-            <div className="notification-time">{item.timestamp}</div>
-          </div>
-        ))}
+        <NotificationPanel onClose={() => setDrawerOpen(false)} />
       </Drawer>
     </Layout>
   )

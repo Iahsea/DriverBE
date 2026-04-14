@@ -10,8 +10,17 @@ function AuthProvider({ children }) {
   const [token, setToken] = useState(localStorage.getItem('access_token') || '')
   const [loading, setLoading] = useState(true)
   const socketRef = useRef(null)
-  const reconnectRef = useRef({ active: false, retries: 0 })
-  const [notifications, setNotifications] = useState([])
+  
+  // Load notifications from localStorage on mount
+  const [notifications, setNotifications] = useState(() => {
+    try {
+      const saved = localStorage.getItem('notifications')
+      return saved ? JSON.parse(saved) : []
+    } catch {
+      return []
+    }
+  })
+  
   const { message } = AntdApp.useApp()
 
   useEffect(() => {
@@ -46,8 +55,6 @@ function AuthProvider({ children }) {
 
   useEffect(() => {
     if (!token) {
-      reconnectRef.current.active = false
-      reconnectRef.current.retries = 0
       if (socketRef.current) {
         socketRef.current.close()
         socketRef.current = null
@@ -56,55 +63,59 @@ function AuthProvider({ children }) {
       return
     }
 
-    reconnectRef.current.active = true
-    reconnectRef.current.retries = 0
-
-    const connect = () => {
-      if (!reconnectRef.current.active) {
-        return
-      }
-
-      const socket = createNotificationSocket(token, {
-        onMessage: (payload) => {
-          if (!payload) {
-            return
+    const socketManager = createNotificationSocket(token, {
+      onMessage: (payload) => {
+        if (!payload) {
+          return
+        }
+        
+        // Add id and read status to notification
+        const notification = {
+          ...payload,
+          id: Math.random().toString(36).substr(2, 9) + Date.now(),
+          read: false,
+          receivedAt: new Date().toISOString(),
+        }
+        
+        setNotifications((prev) => {
+          const updated = [notification, ...prev].slice(0, 50)
+          // Save to localStorage
+          try {
+            localStorage.setItem('notifications', JSON.stringify(updated))
+          } catch {
+            console.warn('Failed to save notifications to localStorage')
           }
-          setNotifications((prev) => [payload, ...prev].slice(0, 30))
+          return updated
+        })
 
-          if (payload.type === 'friend_request') {
-            message.info(payload.message || 'New friend request')
-          } else if (payload.type === 'friend_request_accepted') {
-            message.success(payload.message || 'Friend request accepted')
-          } else if (payload.type === 'friend_request_rejected') {
-            message.warning(payload.message || 'Friend request rejected')
-          } else if (payload.type === 'friend_request_canceled') {
-            message.warning(payload.message || 'Friend request canceled')
-          } else if (payload.type === 'friend_deleted') {
-            message.warning(payload.message || 'Friend removed')
-          }
-        },
-        onError: () => {
-          if (reconnectRef.current.retries === 0) {
-            message.warning('Notification socket disconnected')
-          }
-        },
-        onClose: () => {
-          if (!reconnectRef.current.active) {
-            return
-          }
-          reconnectRef.current.retries += 1
-          const retryDelay = Math.min(5000, 1000 * reconnectRef.current.retries)
-          setTimeout(connect, retryDelay)
-        },
-      })
+        if (payload.type === 'friend_request') {
+          message.info(payload.message || 'New friend request')
+        } else if (payload.type === 'friend_request_accepted') {
+          message.success(payload.message || 'Friend request accepted')
+        } else if (payload.type === 'friend_request_rejected') {
+          message.warning(payload.message || 'Friend request rejected')
+        } else if (payload.type === 'friend_request_canceled') {
+          message.warning(payload.message || 'Friend request canceled')
+        } else if (payload.type === 'friend_deleted') {
+          message.warning(payload.message || 'Friend removed')
+        }
+      },
+      onOpen: () => {
+        console.log('Notification socket connected')
+      },
+      onError: (error) => {
+        console.error('Notification socket error:', error)
+      },
+      onClose: (event) => {
+        console.warn('Notification socket closed:', event.code, event.reason)
+        // Reconnect logic is now handled inside createNotificationSocket
+        // with exponential backoff retry
+      },
+    })
 
-      socketRef.current = socket
-    }
-
-    connect()
+    socketRef.current = socketManager
 
     return () => {
-      reconnectRef.current.active = false
       if (socketRef.current) {
         socketRef.current.close()
         socketRef.current = null
@@ -131,17 +142,46 @@ function AuthProvider({ children }) {
     setUser(null)
   }
 
+  function markNotificationAsRead(notificationId) {
+    setNotifications((prev) => {
+      const updated = prev.map((n) =>
+        n.id === notificationId ? { ...n, read: true } : n
+      )
+      localStorage.setItem('notifications', JSON.stringify(updated))
+      return updated
+    })
+  }
+
+  function markAllNotificationsAsRead() {
+    setNotifications((prev) => {
+      const updated = prev.map((n) => ({ ...n, read: true }))
+      localStorage.setItem('notifications', JSON.stringify(updated))
+      return updated
+    })
+  }
+
+  function clearNotifications() {
+    setNotifications([])
+    localStorage.removeItem('notifications')
+  }
+
+  const unreadCount = notifications.filter((n) => !n.read).length
+
   const value = useMemo(
     () => ({
       user,
       token,
       loading,
       notifications,
+      unreadCount,
       login,
       register,
       logout,
+      markNotificationAsRead,
+      markAllNotificationsAsRead,
+      clearNotifications,
     }),
-    [user, token, loading, notifications]
+    [user, token, loading, notifications, unreadCount]
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

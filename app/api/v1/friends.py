@@ -476,19 +476,6 @@ async def send_friend_request(
             }
         )
         
-        # Gửi notification tới to_user (nếu đang online)
-        await notification_manager.broadcast_to_user(
-            request_data.to_user_id,
-            {
-                "type": "friend_request",
-                "from_user_id": current_user.id,
-                "from_username": current_user.username,
-                "request_id": new_request.id,
-                "message": f"{current_user.username} muốn kết bạn với bạn",
-                "timestamp": datetime.now().isoformat(),
-            }
-        )
-        
         return FriendRequestResponse(
             id=new_request.id,
             from_user_id=new_request.from_user_id,
@@ -596,31 +583,6 @@ async def accept_friend_request(
         db.refresh(friend_request)
         
         logger.info(f"✓ Friend request accepted: {from_user.username} ↔ {to_user.username}")
-        
-        # Gửi notification tới cả 2 users (nếu online)
-        # Notification cho from_user (người gửi request)
-        await notification_manager.broadcast_to_user(
-            friend_request.from_user_id,
-            {
-                "type": "friend_request_accepted",
-                "user_id": current_user.id,
-                "username": current_user.username,
-                "message": f"Bạn đã trở thành bạn với {current_user.username}",
-                "timestamp": datetime.now().isoformat(),
-            }
-        )
-        
-        # Notification cho to_user (người nhận request - current_user)
-        await notification_manager.broadcast_to_user(
-            current_user.id,
-            {
-                "type": "friend_request_accepted",
-                "user_id": from_user.id,
-                "username": from_user.username,
-                "message": f"Bạn đã trở thành bạn với {from_user.username}",
-                "timestamp": datetime.now().isoformat(),
-            }
-        )
         
         # Gửi notification tới cả 2 users (nếu online)
         # Notification cho from_user (người gửi request)
@@ -820,18 +782,6 @@ async def cancel_friend_request(
         to_user = db.query(User).filter(User.id == friend_request.to_user_id).first()
         
         logger.info(f"✓ Friend request canceled: {from_user.username} ↛ {to_user.username}")
-        
-        # Gửi notification tới to_user (người nhận request)
-        await notification_manager.broadcast_to_user(
-            friend_request.to_user_id,
-            {
-                "type": "friend_request_canceled",
-                "user_id": current_user.id,
-                "username": current_user.username,
-                "message": f"{current_user.username} đã hủy lời mời kết bạn",
-                "timestamp": datetime.now().isoformat(),
-            }
-        )
         
         # Gửi notification tới to_user (người nhận request)
         await notification_manager.broadcast_to_user(

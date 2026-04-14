@@ -25,9 +25,17 @@ class NotificationManager:
         """
         Khi user kết nối tới /ws/notifications
         """
-        await websocket.accept()
-        self.active_connections[user_id] = websocket
-        logger.info(f"✓ User {user_id[:8]}... connected to notifications")
+        try:
+            await websocket.accept()
+            self.active_connections[user_id] = websocket
+            logger.info(f"✓ User {user_id[:8]}... connected to notifications")
+        except Exception as e:
+            logger.error(f"Error accepting websocket for {user_id[:8]}...: {e}")
+            # Không thêm vào connections nếu accept fail
+            try:
+                await websocket.close(code=1000)
+            except Exception as close_e:
+                logger.debug(f"Error closing websocket during connect failure: {close_e}")
     
     def disconnect(self, user_id: str):
         """
@@ -55,17 +63,25 @@ class NotificationManager:
                     "timestamp": "2026-04-09T10:30:00"
                 }
         """
-        if user_id in self.active_connections:
-            try:
-                await self.active_connections[user_id].send_json(message)
-                logger.info(f"✓ Notification ({message.get('type')}) sent to {user_id[:8]}...")
-            except Exception as e:
-                logger.error(f"Error sending notification to {user_id[:8]}...: {e}")
-                # Disconnect user nếu có lỗi gửi
-                self.disconnect(user_id)
-        else:
+        if user_id not in self.active_connections:
             # User offline - notification bị miss
             logger.debug(f"User {user_id[:8]}... offline - notification skipped")
+            return
+        
+        websocket = self.active_connections[user_id]
+        try:
+            await websocket.send_json(message)
+            logger.info(f"✓ Notification ({message.get('type')}) sent to {user_id[:8]}...")
+        except Exception as e:
+            logger.error(f"Error sending notification to {user_id[:8]}...: {e}")
+            # Disconnect user nếu có lỗi gửi - graceful cleanup
+            try:
+                await websocket.close(code=1000, reason="Notification send failed")
+            except Exception as close_e:
+                logger.debug(f"Error closing websocket after send failure: {close_e}")
+            finally:
+                # Luôn remove khỏi connections dict
+                self.disconnect(user_id)
     
     async def broadcast_to_users(self, user_ids: list, message: dict):
         """

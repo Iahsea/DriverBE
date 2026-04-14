@@ -1,6 +1,6 @@
 import { BrowserRouter as Router, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { useState } from 'react'
-import { Layout, Button, Menu, Avatar, Dropdown } from 'antd'
+import { Layout, Button, Menu, Avatar, Dropdown, Badge, Drawer } from 'antd'
 import {
   MessageOutlined,
   TeamOutlined,
@@ -12,12 +12,14 @@ import AuthPage from './pages/AuthPage'
 import ChatPage from './pages/ChatPage'
 import FriendsPage from './pages/FriendsPage'
 import ProfilePage from './pages/ProfilePage'
+import NotificationPanel from './components/NotificationPanel'
 import { useAuth } from './store/auth'
 import './App.css'
 
 function AppShell({ children }) {
-  const { user, logout } = useAuth()
+  const { user, logout, unreadCount } = useAuth()
   const [collapsed, setCollapsed] = useState(false)
+  const [notificationDrawerOpen, setNotificationDrawerOpen] = useState(false)
   const navigate = useNavigate()
   const location = useLocation()
 
@@ -83,7 +85,14 @@ function AppShell({ children }) {
           </div>
 
           <div className="header-right">
-            <Button type="text" icon={<BellOutlined />} />
+            <Badge count={unreadCount} size="small" offset={[-4, 4]} color="#ff4d4f">
+              <Button 
+                type="text" 
+                icon={<BellOutlined />} 
+                onClick={() => setNotificationDrawerOpen(true)}
+                style={{ fontSize: 18 }}
+              />
+            </Badge>
             <Dropdown menu={userMenu} trigger={['click']}>
               <Avatar style={{ backgroundColor: '#1890ff', cursor: 'pointer' }}>
                 {user?.username?.slice(0, 1).toUpperCase() || 'U'}
@@ -94,6 +103,18 @@ function AppShell({ children }) {
 
         <div className="app-content">{children}</div>
       </Layout>
+
+      <Drawer
+        title={null}
+        placement="right"
+        onClose={() => setNotificationDrawerOpen(false)}
+        open={notificationDrawerOpen}
+        width={360}
+        bodyStyle={{ padding: 0, display: 'flex', flexDirection: 'column' }}
+        headerStyle={{ display: 'none' }}
+      >
+        <NotificationPanel onClose={() => setNotificationDrawerOpen(false)} />
+      </Drawer>
     </Layout>
   )
 }
