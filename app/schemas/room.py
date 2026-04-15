@@ -71,6 +71,11 @@ class RoomListResponse(BaseModel):
     is_group: bool
     member_count: Optional[int] = None
     last_message_at: Optional[datetime] = None
+    display_name: Optional[str] = None
+    peer_id: Optional[str] = None
+    last_message_preview: Optional[str] = None
+    has_unread: bool = False
+    created_at: Optional[datetime] = None
     
     class Config:
         from_attributes = True

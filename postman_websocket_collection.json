@@ -1,0 +1,27 @@
+{
+  "info": {
+    "name": "Secure Chat WebSocket",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_ws", "value": "ws://127.0.0.1:8000" },
+    { "key": "token", "value": "" },
+    { "key": "room_id", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Chat Socket",
+      "request": {
+        "method": "GET",
+        "url": "{{base_ws}}/ws/chat/{{room_id}}?token={{token}}"
+      }
+    },
+    {
+      "name": "Notifications Socket",
+      "request": {
+        "method": "GET",
+        "url": "{{base_ws}}/ws/notifications?token={{token}}"
+      }
+    }
+  ]
+}

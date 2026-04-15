@@ -50,6 +50,8 @@ class UserResponse(BaseModel):
     is_active: bool
     is_verified: bool
     created_at: datetime
+    is_friend: bool = False  # Có là bạn không
+    is_pending: bool = False  # Có pending request không
     
     class Config:
         from_attributes = True
@@ -61,6 +63,8 @@ class UserResponse(BaseModel):
                 "is_active": True,
                 "is_verified": False,
                 "created_at": "2026-04-08T21:50:00Z",
+                "is_friend": False,
+                "is_pending": False,
             }
         }
 

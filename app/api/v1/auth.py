@@ -19,10 +19,11 @@ from app.schemas.user import (
 )
 from app.core.crypto_bridge import crypto_bridge
 from app.core.security import create_access_token, verify_access_token, get_token_from_header
-from app.database.models import User
+from app.core.id_utils import normalize_uuid
+from app.database.models import User, FriendRequest, Friendship
+from sqlalchemy import text, or_
 from app.database.database import get_db
 from datetime import datetime
-from uuid import UUID
 import logging
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -310,12 +311,7 @@ async def get_current_user(
             user_id_str = payload.get("user_id")
             if not user_id_str:
                 raise ValueError("Invalid token payload")
-            
-            # Convert string UUID to UUID object
-            try:
-                user_id = UUID(user_id_str)
-            except (ValueError, TypeError):
-                raise ValueError("Invalid user_id format in token")
+            user_id = normalize_uuid(user_id_str)
         except HTTPException:
             raise
         except Exception as e:
@@ -343,6 +339,106 @@ async def get_current_user(
         raise
     except Exception as e:
         logger.error(f"Unexpected error in get_current_user: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Lỗi hệ thống",
+        )
+
+
+# ==================== Get User by ID Endpoint ====================
+
+@router.get(
+    "/users/{user_id}",
+    response_model=UserResponse,
+    summary="Lấy thông tin user theo ID",
+    description="Lấy thông tin công khai của một user theo user_id, kèm theo bạn bè status",
+)
+async def get_user_by_id(
+    user_id: str,
+    authorization: str = Header(None),
+    db: Session = Depends(get_db),
+) -> UserResponse:
+    """
+    Lấy thông tin user theo user_id và kiểm tra bạn bè status.
+    
+    Args:
+        user_id: ID của user cần lấy thông tin
+        authorization: Optional Authorization header (format: "Bearer {token}")
+        db: Database session
+    
+    Returns:
+        UserResponse với user info + is_friend + is_pending fields
+    
+    Raises:
+        404: User không tìm thấy
+    """
+    try:
+        user_id_norm = normalize_uuid(user_id)
+        
+        # Query user từ database
+        user = db.query(User).filter(User.id == user_id_norm).first()
+        if not user:
+            logger.warning(f"User not found: {user_id}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User không tìm thấy",
+            )
+        
+        # Get current user ID từ token (if provided)
+        current_user_id = None
+        is_friend = False
+        is_pending = False
+        
+        if authorization:
+            try:
+                token = get_token_from_header(authorization)
+                if token:
+                    payload = verify_access_token(token)
+                    user_id_str = payload.get("user_id")
+                    if user_id_str:
+                        current_user_id = normalize_uuid(user_id_str)
+            except Exception as e:
+                logger.debug(f"Token verification failed in get_user_by_id: {e}")
+                pass  # Continue without auth
+        
+        # Check friend status if we have current user
+        if current_user_id and current_user_id != user_id_norm:
+            # Check if they are friends
+            min_id = min(current_user_id, user_id_norm)
+            max_id = max(current_user_id, user_id_norm)
+            
+            friendship = db.query(Friendship).filter(
+                Friendship.user_id_1 == min_id,
+                Friendship.user_id_2 == max_id
+            ).first()
+            
+            if friendship:
+                is_friend = True
+            else:
+                # Check if there's a pending request (either direction)
+                pending_request = db.query(FriendRequest).filter(
+                    FriendRequest.status == "pending",
+                    or_(
+                        (FriendRequest.from_user_id == current_user_id) & (FriendRequest.to_user_id == user_id_norm),
+                        (FriendRequest.from_user_id == user_id_norm) & (FriendRequest.to_user_id == current_user_id)
+                    )
+                ).first()
+                
+                if pending_request:
+                    is_pending = True
+        
+        logger.debug(f"Retrieved user info: {user.username} (friend={is_friend}, pending={is_pending})")
+        
+        # Create response with friend status
+        response = UserResponse.from_orm(user)
+        response.is_friend = is_friend
+        response.is_pending = is_pending
+        return response
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in get_user_by_id: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Lỗi hệ thống",

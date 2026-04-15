@@ -232,3 +232,8 @@ class ConnectionManager:
             List of user IDs
         """
         return list(self.active_connections.get(room_id, {}).keys())
+
+
+
+# Shared singleton instance for use across the app
+connection_manager = ConnectionManager()

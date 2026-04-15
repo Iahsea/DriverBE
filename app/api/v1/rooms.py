@@ -23,14 +23,35 @@ from app.schemas.room import (
 )
 from app.schemas.message import MessageResponse, MessageListResponse
 from app.core.security import verify_access_token, get_token_from_header
+from app.core.id_utils import normalize_uuid
+from app.core.crypto_bridge import crypto_bridge
 from app.database.models import User, Room, RoomMember, Message, Friendship
+from app.websocket.connection_manager import connection_manager
 from app.database.database import get_db
 from datetime import datetime
-from uuid import UUID
 import logging
 
 router = APIRouter(prefix="/rooms", tags=["Rooms"])
 logger = logging.getLogger(__name__)
+
+
+def _is_effective_group(room: Room) -> bool:
+    """Backward-compatible group detection.
+
+    Some older frontend flows created a "group" room without setting `is_group=True`.
+    Direct rooms created from friend acceptance use the conventional name "A & B".
+    """
+    if room.is_group:
+        return True
+    # Heuristic: treat conventional direct-room naming as 1-1.
+    if room.name and " & " in room.name:
+        try:
+            if room.members is not None and len(room.members) == 2:
+                return False
+        except Exception:
+            # If relationship isn't loaded for some reason, fall back to name heuristic.
+            return False
+    return True
 
 
 def get_current_user(authorization: str = Header(...), db: Session = Depends(get_db)) -> User:
@@ -50,6 +71,7 @@ def get_current_user(authorization: str = Header(...), db: Session = Depends(get
         user_id = payload.get("user_id")
         if not user_id:
             raise ValueError("Invalid token payload: no user_id")
+        user_id = normalize_uuid(user_id)
         
         # Query user by ID (String format)
         user = db.query(User).filter(User.id == user_id).first()
@@ -100,12 +122,46 @@ async def list_rooms(
                 Message.room_id == room.id
             ).order_by(desc(Message.created_at)).first()
             
+            # Check if there are unread messages from other users
+            has_unread = False
+            try:
+                has_unread = db.query(Message).filter(
+                    (Message.room_id == room.id) &
+                    (Message.sender_id != current_user.id) &
+                    (Message.is_read == False)
+                ).first() is not None
+            except Exception as e:
+                # If is_read column doesn't exist yet, set has_unread to False
+                logger.debug(f"Note: Could not check unread status: {e}")
+                has_unread = False
+            
+            effective_is_group = _is_effective_group(room)
+            display_name = room.name
+            peer_id = None
+            if not effective_is_group:
+                peer = next(
+                    (member.user for member in room.members if member.user_id != current_user.id),
+                    None,
+                )
+                if peer:
+                    display_name = peer.username
+                    peer_id = peer.id
+
+            last_message_preview = None
+            if last_message and last_message.content:
+                last_message_preview = last_message.content
+
             room_list = RoomListResponse(
                 id=room.id,
                 name=room.name,
-                is_group=room.is_group,
+                is_group=effective_is_group,
                 member_count=len(room.members) if room.members else 0,
                 last_message_at=last_message.created_at if last_message else None,
+                display_name=display_name,
+                peer_id=peer_id,
+                last_message_preview=last_message_preview,
+                has_unread=has_unread,
+                created_at=room.created_at,
             )
             rooms.append(room_list)
         
@@ -192,7 +248,8 @@ async def get_room(
     """
     try:
         # Kiểm tra room tồn tại
-        room = db.query(Room).filter(Room.id == room_id).first()
+        room_id_norm = normalize_uuid(room_id)
+        room = db.query(Room).filter(Room.id == room_id_norm).first()
         if not room:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -201,7 +258,7 @@ async def get_room(
         
         # Kiểm tra user là member
         member = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
+            (RoomMember.room_id == room_id_norm) & 
             (RoomMember.user_id == current_user.id)
         ).first()
         
@@ -222,12 +279,14 @@ async def get_room(
                 "role": room_member.role,
                 "joined_at": room_member.joined_at.isoformat(),
             })
+
+        effective_is_group = _is_effective_group(room)
         
         return {
             "id": room.id,
             "name": room.name,
             "description": room.description,
-            "is_group": room.is_group,
+            "is_group": effective_is_group,
             "created_by_id": room.created_by_id,
             "created_at": room.created_at.isoformat(),
             "updated_at": room.updated_at.isoformat(),
@@ -261,7 +320,8 @@ async def delete_room(
     Xóa phòng. Chỉ admin mới có thể xóa.
     """
     try:
-        room = db.query(Room).filter(Room.id == room_id).first()
+        room_id_norm = normalize_uuid(room_id)
+        room = db.query(Room).filter(Room.id == room_id_norm).first()
         if not room:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -270,7 +330,7 @@ async def delete_room(
         
         # Kiểm tra user là admin
         member = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
+            (RoomMember.room_id == room_id_norm) & 
             (RoomMember.user_id == current_user.id)
         ).first()
         
@@ -315,16 +375,23 @@ async def add_member(
     """
     try:
         # Kiểm tra room tồn tại
-        room = db.query(Room).filter(Room.id == room_id).first()
+        room_id_norm = normalize_uuid(room_id)
+        room = db.query(Room).filter(Room.id == room_id_norm).first()
         if not room:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Phòng không tìm thấy",
             )
+
+        if not _is_effective_group(room):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Không thể thêm thành viên vào chat 1-1",
+            )
         
         # Kiểm tra current user là admin/moderator
         current_member = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
+            (RoomMember.room_id == room_id_norm) & 
             (RoomMember.user_id == current_user.id)
         ).first()
         
@@ -335,7 +402,8 @@ async def add_member(
             )
         
         # Kiểm tra user cần thêm tồn tại
-        new_user = db.query(User).filter(User.id == member_data.user_id).first()
+        new_user_id = normalize_uuid(member_data.user_id)
+        new_user = db.query(User).filter(User.id == new_user_id).first()
         if not new_user:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -343,8 +411,8 @@ async def add_member(
             )
         
         # Kiểm tra xem admin và user cần thêm có phải bạn bè không
-        user_id_1 = min(current_user.id, member_data.user_id)
-        user_id_2 = max(current_user.id, member_data.user_id)
+        user_id_1 = min(current_user.id, new_user_id)
+        user_id_2 = max(current_user.id, new_user_id)
         
         friendship = db.query(Friendship).filter(
             (Friendship.user_id_1 == user_id_1) & 
@@ -359,8 +427,8 @@ async def add_member(
         
         # Kiểm tra user đã là member chưa
         existing = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
-            (RoomMember.user_id == member_data.user_id)
+            (RoomMember.room_id == room_id_norm) & 
+            (RoomMember.user_id == new_user_id)
         ).first()
         
         if existing:
@@ -371,8 +439,8 @@ async def add_member(
         
         # Thêm member mới
         new_member = RoomMember(
-            room_id=room_id,
-            user_id=member_data.user_id,
+            room_id=room_id_norm,
+            user_id=new_user_id,
             role=member_data.role,
         )
         
@@ -380,6 +448,14 @@ async def add_member(
         db.commit()
         db.refresh(new_member)
         
+        if room.is_group:
+            await connection_manager.broadcast_to_room(room_id_norm, {
+                "type": "system",
+                "content": f"👋 {new_user.username} đã tham gia phòng",
+                "user_id": new_user.id,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+
         logger.info(f"✓ Member {new_user.username} added to room {room.name}")
         
         return {
@@ -419,16 +495,23 @@ async def remove_member(
     Xóa user khỏi phòng. Admin/moderator mới có thể xóa.
     """
     try:
-        room = db.query(Room).filter(Room.id == room_id).first()
+        room_id_norm = normalize_uuid(room_id)
+        room = db.query(Room).filter(Room.id == room_id_norm).first()
         if not room:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Phòng không tìm thấy",
             )
+
+        if not _is_effective_group(room):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Không thể xóa thành viên khỏi chat 1-1",
+            )
         
         # Kiểm tra current user là admin/moderator
         current_member = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
+            (RoomMember.room_id == room_id_norm) & 
             (RoomMember.user_id == current_user.id)
         ).first()
         
@@ -439,9 +522,10 @@ async def remove_member(
             )
         
         # Tìm member cần xóa
+        user_id_norm = normalize_uuid(user_id)
         member = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
-            (RoomMember.user_id == user_id)
+            (RoomMember.room_id == room_id_norm) & 
+            (RoomMember.user_id == user_id_norm)
         ).first()
         
         if not member:
@@ -487,8 +571,9 @@ async def get_messages(
     """
     try:
         # Kiểm tra user là member
+        room_id_norm = normalize_uuid(room_id)
         member = db.query(RoomMember).filter(
-            (RoomMember.room_id == room_id) & 
+            (RoomMember.room_id == room_id_norm) & 
             (RoomMember.user_id == current_user.id)
         ).first()
         
@@ -499,23 +584,58 @@ async def get_messages(
             )
         
         # Lấy tin nhắn
-        total = db.query(Message).filter(Message.room_id == room_id).count()
+        total = db.query(Message).filter(Message.room_id == room_id_norm).count()
         messages_db = db.query(Message).filter(
-            Message.room_id == room_id
+            Message.room_id == room_id_norm
         ).order_by(desc(Message.created_at)).offset(skip).limit(limit).all()
         
         messages = []
+        messages_to_mark_read = []
+        
         for msg in messages_db:
+            content = msg.content
+            if msg.content_encrypted:
+                try:
+                    content = await crypto_bridge.decrypt_message_payload(msg.content_encrypted)
+                except Exception as e:
+                    logger.warning(f"Failed to decrypt message {msg.id}: {e}")
+
+            # Mark messages as read if not sent by current user and not already read
+            # Use getattr with default False for backward compatibility if column doesn't exist
+            is_read = getattr(msg, 'is_read', False)
+            read_at = getattr(msg, 'read_at', None)
+            
+            try:
+                if msg.sender_id != current_user.id and not is_read:
+                    messages_to_mark_read.append(msg)
+                    msg.is_read = True
+                    msg.read_at = datetime.utcnow()
+                    is_read = True
+                    read_at = msg.read_at
+            except Exception as e:
+                logger.debug(f"Could not mark message as read: {e}")
+
             messages.append(MessageResponse(
                 id=msg.id,
                 room_id=msg.room_id,
                 sender_id=msg.sender_id,
                 sender_name=msg.sender.username,
-                content=msg.content,
+                content=content,
                 content_encrypted=msg.content_encrypted,
+                is_read=is_read,
+                read_at=read_at,
                 created_at=msg.created_at,
                 updated_at=msg.updated_at,
             ))
+        
+        # Commit read status updates
+        if messages_to_mark_read:
+            try:
+                db.commit()
+                logger.debug(f"Marked {len(messages_to_mark_read)} messages as read")
+            except Exception as e:
+                logger.error(f"Failed to mark messages as read: {e}")
+                db.rollback()
         
         # Reverse để sắp xếp từ cũ nhất đến mới nhất
         messages.reverse()

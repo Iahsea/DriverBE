@@ -1,0 +1,4 @@
+.venv/
+crypto_chat_driver/.venv/
+__pycache__/
+*.pyc

@@ -7,6 +7,7 @@ Cây cầu giao tiếp giữa Python (User-mode) và Kernel Driver.
 - Async wrapper để tránh tắc nghẽn event loop
 """
 
+import base64
 import ctypes
 import hashlib
 import logging
@@ -23,9 +24,17 @@ logger = logging.getLogger(__name__)
 
 class IOCTLOperation(IntEnum):
     """IOCTL operation codes (phải khớp với Kernel Driver)"""
-    IOCTL_HASH_MD5 = 0x00000001
-    IOCTL_ENCRYPT_AES = 0x00000002
-    IOCTL_DECRYPT_AES = 0x00000003
+    # Using _IOW macro format: _IOW(type, nr, size)
+    # type = 'c' = 0x63, size calculated from ctypes structures
+    pass
+
+# Placeholder - will be calculated after struct definitions
+def _iow(type_char: int, nr: int, size: int) -> int:
+    """Calculate IOCTL code using _IOW macro"""
+    # _IOW(type, nr, size) = _IOC(_IOC_WRITE, type, nr, size)
+    # _IOC(dir, type, nr, size) = ((dir) << 30) | ((type) << 8) | ((nr) << 0) | ((size) << 16)
+    # _IOC_WRITE = 1
+    return ((1 << 30) | (type_char << 8) | nr | (size << 16))
 
 
 # ==================== ctypes Structures (Data Alignment) ====================
@@ -76,6 +85,14 @@ class AESBuffer(ctypes.Structure):
         ("data", ctypes.c_ubyte * 512),
         ("output", ctypes.c_ubyte * 512),
     ]
+
+# ==================== Calculate IOCTL Codes ====================
+# Now that structures are defined, populate IOCTLOperation enum
+CRYPTO_IOCTL_MAGIC = ord('c')  # 0x63
+
+IOCTLOperation.IOCTL_HASH_MD5 = _iow(CRYPTO_IOCTL_MAGIC, 1, ctypes.sizeof(MD5HashBuffer))
+IOCTLOperation.IOCTL_ENCRYPT_AES = _iow(CRYPTO_IOCTL_MAGIC, 2, ctypes.sizeof(AESBuffer))
+IOCTLOperation.IOCTL_DECRYPT_AES = _iow(CRYPTO_IOCTL_MAGIC, 3, ctypes.sizeof(AESBuffer))
 
 
 # ==================== Crypto Bridge Class ====================
@@ -239,6 +256,7 @@ class CryptoBridge:
         
         if self.driver_available:
             try:
+
                 password_bytes = password.encode("utf-8")
                 hash_result = await loop.run_in_executor(
                     self.executor,
@@ -254,6 +272,66 @@ class CryptoBridge:
             self.executor,
             self._hash_mock,
             password,
+        )
+
+    async def hash_message_content(self, content: str) -> str:
+        """
+        Hash message content dùng Kernel Driver (MD5) - Integrity Verification.
+        
+        Tương tự như hash_password_with_driver() nhưng cho message plaintext.
+        Dùng Driver Windows/Linux để tính MD5 hash - detect tampering.
+        
+        Args:
+            content: Plaintext message content
+        
+        Returns:
+            MD5 hash (32 hex characters) - e.g., "a1b2c3d4e5f6..."
+        
+        Process:
+            1. Encode content thành bytes (UTF-8)
+            2. Gửi xuống Driver via IOCTL (Windows DLL / Linux device)
+            3. Driver tính MD5 hash
+            4. Driver trả về 32 bytes hash
+            5. Convert thành hex string
+            6. Return hash
+        
+        Use case - Integrity Verification:
+            Client1 sends: "Hello Client2"
+                ↓
+            Backend:
+              1. hash = MD5("Hello Client2") = "a1b2c3d4..." via driver
+              2. encrypted = AES_encrypt("Hello Client2")
+              3. DB save: {content, content_encrypted, message_hash}
+              4. WebSocket broadcast: {content_encrypted, message_hash}
+                ↓
+            Client2 receives encrypted message + hash
+              1. plaintext = AES_decrypt(content_encrypted)
+              2. computed_hash = MD5(plaintext) = "a1b2c3d4..."
+              3. Verify: computed_hash === message_hash ✓ (toàn vẹn)
+                                                      ✗ (bị tampering)
+        """
+        loop = asyncio.get_event_loop()
+        
+        # Try driver first (Windows DLL hoặc Linux ioctl)
+        if self.driver_available:
+            try:
+                content_bytes = content.encode("utf-8")
+                hash_result = await loop.run_in_executor(
+                    self.executor,
+                    self._hash_via_driver,
+                    content_bytes,
+                )
+                logger.info(f"✓ Message hash via driver: {hash_result[:16]}...")
+                return hash_result
+            except Exception as e:
+                logger.warning(f"Driver message hash failed: {e}, falling back to mock")
+        
+        # Fallback sang mock (hashlib) nếu driver unavailable
+        logger.info("⚠️  Using mock MD5 hash (driver not available)")
+        return await loop.run_in_executor(
+            self.executor,
+            self._hash_mock,
+            content,
         )
 
     async def encrypt_aes_with_driver(
@@ -338,6 +416,60 @@ class CryptoBridge:
             iv,
         )
 
+    @staticmethod
+    def _pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
+        pad_len = block_size - (len(data) % block_size)
+        return data + bytes([pad_len]) * pad_len
+
+    @staticmethod
+    def _pkcs7_unpad(data: bytes, block_size: int = 16) -> bytes:
+        if not data or (len(data) % block_size) != 0:
+            raise ValueError("Invalid padded data length")
+        pad_len = data[-1]
+        if pad_len < 1 or pad_len > block_size:
+            raise ValueError("Invalid padding length")
+        if data[-pad_len:] != bytes([pad_len]) * pad_len:
+            raise ValueError("Invalid padding bytes")
+        return data[:-pad_len]
+
+    @staticmethod
+    def _get_aes_key_from_env() -> bytes:
+        key_hex = os.getenv("AES_KEY_HEX")
+        if not key_hex:
+            raise RuntimeError("AES_KEY_HEX is not set")
+        if len(key_hex) != 64:
+            raise ValueError("AES_KEY_HEX must be 64 hex chars (32 bytes)")
+        try:
+            return bytes.fromhex(key_hex)
+        except ValueError as e:
+            raise ValueError("AES_KEY_HEX contains non-hex characters") from e
+
+    async def encrypt_message_payload(self, plaintext: str) -> str:
+        key = self._get_aes_key_from_env()
+        iv = os.urandom(16)
+        padded = self._pkcs7_pad(plaintext.encode("utf-8"))
+        if len(padded) > 512:
+            raise ValueError("Message too long after padding (max 512 bytes)")
+        ciphertext = await self.encrypt_aes_with_driver(padded, key, iv)
+        payload = iv + ciphertext
+        return base64.b64encode(payload).decode("ascii")
+
+    async def decrypt_message_payload(self, payload_b64: str) -> str:
+        key = self._get_aes_key_from_env()
+        try:
+            payload = base64.b64decode(payload_b64.encode("ascii"), validate=True)
+        except Exception as e:
+            raise ValueError("Invalid base64 payload") from e
+        if len(payload) < 16:
+            raise ValueError("Invalid payload length")
+        iv = payload[:16]
+        ciphertext = payload[16:]
+        if len(ciphertext) % 16 != 0:
+            raise ValueError("Invalid ciphertext length")
+        plaintext_padded = await self.decrypt_aes_with_driver(ciphertext, key, iv)
+        plaintext = self._pkcs7_unpad(plaintext_padded)
+        return plaintext.decode("utf-8")
+
     # ==================== Driver Implementation ====================
 
     def _hash_via_driver(self, password_bytes: bytes) -> str:
@@ -411,8 +543,11 @@ class CryptoBridge:
             # Gọi ioctl
             logger.debug(f"[Linux] Calling ioctl IOCTL_HASH_MD5 for {len(password_bytes)} bytes")
             
-            with open(self.device_path, "rb+") as f:
-                fcntl.ioctl(f, IOCTLOperation.IOCTL_HASH_MD5, buffer)
+            fd = os.open(self.device_path, os.O_RDWR)
+            try:
+                fcntl.ioctl(fd, IOCTLOperation.IOCTL_HASH_MD5, buffer)
+            finally:
+                os.close(fd)
             
             hash_bytes = bytes(buffer.hash)
             logger.debug(f"[Linux] Hash result: {hash_bytes.hex()}")
@@ -512,8 +647,11 @@ class CryptoBridge:
             
             logger.debug(f"[Linux] Calling ioctl IOCTL_ENCRYPT_AES for {len(plaintext)} bytes")
             
-            with open(self.device_path, "rb+") as f:
-                fcntl.ioctl(f, IOCTLOperation.IOCTL_ENCRYPT_AES, buffer)
+            fd = os.open(self.device_path, os.O_RDWR)
+            try:
+                fcntl.ioctl(fd, IOCTLOperation.IOCTL_ENCRYPT_AES, buffer)
+            finally:
+                os.close(fd)
             
             logger.debug(f"[Linux] Encryption successful")
             return bytes(buffer.output[:buffer.dataLen])
@@ -612,8 +750,11 @@ class CryptoBridge:
             
             logger.debug(f"[Linux] Calling ioctl IOCTL_DECRYPT_AES for {len(ciphertext)} bytes")
             
-            with open(self.device_path, "rb+") as f:
-                fcntl.ioctl(f, IOCTLOperation.IOCTL_DECRYPT_AES, buffer)
+            fd = os.open(self.device_path, os.O_RDWR)
+            try:
+                fcntl.ioctl(fd, IOCTLOperation.IOCTL_DECRYPT_AES, buffer)
+            finally:
+                os.close(fd)
             
             logger.debug(f"[Linux] Decryption successful")
             return bytes(buffer.output[:buffer.dataLen])
@@ -636,8 +777,7 @@ class CryptoBridge:
         hash_obj = hashlib.md5(password.encode("utf-8"))
         return hash_obj.hexdigest()
 
-    @staticmethod
-    def _encrypt_mock(plaintext: bytes, key: bytes, iv: bytes) -> bytes:
+    def _encrypt_mock(self, plaintext: bytes, key: bytes, iv: bytes) -> bytes:
         """
         Mock AES encrypt - dùng library cryptography.
         
@@ -649,6 +789,8 @@ class CryptoBridge:
             
             if len(key) != 32 or len(iv) != 16:
                 raise ValueError("Key must be 32 bytes, IV must be 16 bytes")
+            if len(plaintext) % 16 != 0:
+                raise ValueError("Plaintext length must be a multiple of 16 bytes")
             
             cipher = Cipher(
                 algorithms.AES(key),
@@ -656,18 +798,13 @@ class CryptoBridge:
                 backend=default_backend(),
             )
             encryptor = cipher.encryptor()
-            
-            # Add PKCS7 padding
-            from cryptography.hazmat.primitives import padding
-            padder = padding.PKCS7(128).padder()
-            padded_data = padder.update(plaintext) + padder.finalize()
-            
-            return encryptor.update(padded_data) + encryptor.finalize()
+            result = encryptor.update(plaintext) + encryptor.finalize()
+            logger.debug(f"[Mock] Encrypted {len(plaintext)} bytes to {len(result)} bytes")
+            return result
         except ImportError:
             raise RuntimeError("cryptography library not installed")
 
-    @staticmethod
-    def _decrypt_mock(ciphertext: bytes, key: bytes, iv: bytes) -> bytes:
+    def _decrypt_mock(self, ciphertext: bytes, key: bytes, iv: bytes) -> bytes:
         """
         Mock AES decrypt.
         """
@@ -677,6 +814,8 @@ class CryptoBridge:
             
             if len(key) != 32 or len(iv) != 16:
                 raise ValueError("Key must be 32 bytes, IV must be 16 bytes")
+            if len(ciphertext) % 16 != 0:
+                raise ValueError("Ciphertext length must be a multiple of 16 bytes")
             
             cipher = Cipher(
                 algorithms.AES(key),
@@ -684,14 +823,7 @@ class CryptoBridge:
                 backend=default_backend(),
             )
             decryptor = cipher.decryptor()
-            
-            padded_data = decryptor.update(ciphertext) + decryptor.finalize()
-            
-            # Remove PKCS7 padding
-            from cryptography.hazmat.primitives import padding
-            unpadder = padding.PKCS7(128).unpadder()
-            
-            return unpadder.update(padded_data) + unpadder.finalize()
+            return decryptor.update(ciphertext) + decryptor.finalize()
         except ImportError:
             raise RuntimeError("cryptography library not installed")
 

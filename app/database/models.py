@@ -133,12 +133,22 @@ class Message(Base):
     """
     Message Model - Bảng messages (tin nhắn trong phòng).
     
+    Backend Driver Encryption Flow:
+    1. Client1 gửi plaintext message
+    2. Backend nhận và gọi Kernel Driver encrypt (AES-256-CBC)
+    3. Backend lưu BOTH plaintext + encrypted vào database
+    4. Backend broadcast encrypted message tới room members
+    5. Client2 nhận encrypted, giải mã via Web Crypto API, hiển thị plaintext
+    
     Attributes:
         id: UUID primary key
         room_id: UUID của phòng
         sender_id: UUID của người gửi
-        content: Nội dung tin nhắn (plaintext)
-        content_encrypted: Nội dung mã hóa (AES)
+        content: Nội dung tin nhắn (plaintext - for display/logging)
+        content_encrypted: Nội dung mã hóa (AES-256-CBC via Kernel Driver)
+        message_hash: MD5 hash của plaintext (32 hex chars) - integrity verification via Kernel Driver
+        is_read: Tin nhắn đã được đọc hay chưa
+        read_at: Thời gian đọc tin nhắn
         created_at: Thời gian gửi
         updated_at: Thời gian cập nhật
     """
@@ -147,8 +157,11 @@ class Message(Base):
     id = Column(String(36), primary_key=True, default=lambda: uuid.uuid4().hex, nullable=False)
     room_id = Column(String(36), ForeignKey("rooms.id", ondelete="CASCADE"), nullable=False, index=True)
     sender_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    content = Column(Text, nullable=False)
-    content_encrypted = Column(Text, nullable=True)
+    content = Column(Text, nullable=False)  # Plaintext message (for display/broadcast)
+    content_encrypted = Column(Text, nullable=False)  # AES-256-CBC encrypted via Kernel Driver
+    message_hash = Column(String(64), nullable=True)  # MD5 hash (32 hex chars) - integrity verification via Driver
+    is_read = Column(Boolean, default=False, nullable=False, index=True)
+    read_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

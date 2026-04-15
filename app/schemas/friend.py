@@ -78,3 +78,26 @@ class FriendListResponse(BaseModel):
     """Schema cho GET /api/v1/friends"""
     total: int = Field(..., description="Tổng số bạn bè")
     friends: List[FriendResponse] = Field(..., description="Danh sách bạn bè")
+
+
+class FriendSearchResponse(BaseModel):
+    """Schema cho search user (name/email)"""
+    id: str = Field(..., description="User ID (UUID)")
+    username: str = Field(..., description="Tên đăng nhập")
+    email: str = Field(..., description="Email")
+    mutual_count: int = Field(0, description="Số bạn chung")
+
+    class Config:
+        from_attributes = True
+
+
+class FriendSearchListResponse(BaseModel):
+    """Schema cho GET /api/v1/friends/search"""
+    total: int = Field(..., description="Tổng số kết quả")
+    results: List[FriendSearchResponse] = Field(..., description="Danh sách user")
+
+
+class FriendSuggestionListResponse(BaseModel):
+    """Schema cho GET /api/v1/friends/suggestions"""
+    total: int = Field(..., description="Tổng số gợi ý")
+    suggestions: List[FriendSearchResponse] = Field(..., description="Danh sách user gợi ý")
