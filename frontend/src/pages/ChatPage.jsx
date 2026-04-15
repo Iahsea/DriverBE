@@ -102,17 +102,26 @@ function ChatPage() {
     ? members.find((member) => normalizeId(member.user_id) !== currentUserId)
     : null
 
-  const filteredRooms = rooms.filter((room) =>
-    room.name?.toLowerCase().includes(searchTerm.toLowerCase())
-  )
+  const filteredRooms = rooms.filter((room) => {
+    const q = searchTerm.toLowerCase()
+    return (
+      room.name?.toLowerCase().includes(q) ||
+      room.display_name?.toLowerCase().includes(q)
+    )
+  })
 
   // ⭐ Filter friends for add member dropdown
-  const filteredFriends = friends.filter((friend) => {
+  const memberIdSet = new Set((members || []).map((m) => normalizeId(m.user_id)))
+
+  const filteredFriends = friends
+    .filter((friend) => normalizeId(friend?.id) !== currentUserId)
+    .filter((friend) => !memberIdSet.has(normalizeId(friend?.id)))
+    .filter((friend) => {
     const searchLower = searchMember.toLowerCase()
     return (
       friend.username?.toLowerCase().includes(searchLower) ||
       friend.email?.toLowerCase().includes(searchLower) ||
-      friend.user_id?.toLowerCase().includes(searchLower)
+      friend.id?.toLowerCase().includes(searchLower)
     )
   })
 
@@ -137,7 +146,7 @@ function ChatPage() {
     const duplicates = allIds.filter((id, idx) => allIds.indexOf(id) !== idx)
     if (duplicates.length > 0) {
       const uniqueDups = [...new Set(duplicates)]
-      console.error(`🔴 DUPLICATES IN GLOBAL MESSAGES: ${uniqueDups.join(', ')} (${uniqueDups.length} unique IDs)`)
+      // console.error(`🔴 DUPLICATES IN GLOBAL MESSAGES: ${uniqueDups.join(', ')} (${uniqueDups.length} unique IDs)`)
       uniqueDups.forEach((id) => {
         const copies = messages.filter((m) => m.id === id)
         console.log(`  ${id}: ${copies.length} copies in rooms: ${copies.map(c => c.room_id).join(',')}`)
@@ -779,6 +788,7 @@ function ChatPage() {
       const newRoom = await createRoom({
         name: roomForm.name,
         description: roomForm.description,
+        is_group: true,
       })
       setRoomForm({ name: '', description: '' })
       setModalOpen(false)
@@ -867,7 +877,7 @@ function ChatPage() {
           setLoadingFriends(true)
           const data = await listFriends()
           console.log('✅ Friends loaded:', data)
-          const friendsList = Array.isArray(data) ? data : data?.data || []
+          const friendsList = Array.isArray(data) ? data : data?.friends || []
           setFriends(friendsList)
           console.log(`✅ Set ${friendsList.length} friends`)
         } catch (error) {
@@ -1158,9 +1168,11 @@ function ChatPage() {
           </div>
 
           <div className="info-actions">
-            <Button block icon={<UserAddOutlined />} onClick={() => setMemberModalOpen(true)}>
-              Add Members
-            </Button>
+            {activeRoom?.is_group && (
+              <Button block icon={<UserAddOutlined />} onClick={() => setMemberModalOpen(true)}>
+                Add Members
+              </Button>
+            )}
             <Button
               block
               danger
@@ -1281,12 +1293,12 @@ function ChatPage() {
               </div>
             ) : (
               filteredFriends.map((friend) => {
-                const isSelected = memberForm.userId === friend.user_id
+                const isSelected = memberForm.userId === friend.id
                 return (
                   <div
-                    key={friend.user_id}
+                    key={friend.id}
                     onClick={() =>
-                      setMemberForm({ ...memberForm, userId: friend.user_id })
+                      setMemberForm({ ...memberForm, userId: friend.id })
                     }
                     style={{
                       padding: '10px 12px',

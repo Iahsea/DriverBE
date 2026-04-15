@@ -131,6 +131,7 @@ function NotificationPanel({ onClose }) {
                 onClick={() => handleMarkAsRead(notification.id, isRead)}
               >
                 <div className="notification-item-indicator">
+                  {!isRead && <div className="unread-dot"></div>}
                 </div>
 
                 <div className="notification-item-content">

@@ -30,7 +30,6 @@ class MockWebSocketTest:
     
     async def send_message(self, sender_id: str, room_id: str, content: str):
         """Mô phỏng gửi tin nhắn (mã hóa phía client)"""
-        print(f"\n[📤 GỬI] {sender_id} → Room {room_id[:8]}...")
         print(f"    Nội dung gốc: {content[:60]}{'...' if len(content) > 60 else ''}")
         
         try:

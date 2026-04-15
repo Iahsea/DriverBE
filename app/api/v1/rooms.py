@@ -35,6 +35,25 @@ router = APIRouter(prefix="/rooms", tags=["Rooms"])
 logger = logging.getLogger(__name__)
 
 
+def _is_effective_group(room: Room) -> bool:
+    """Backward-compatible group detection.
+
+    Some older frontend flows created a "group" room without setting `is_group=True`.
+    Direct rooms created from friend acceptance use the conventional name "A & B".
+    """
+    if room.is_group:
+        return True
+    # Heuristic: treat conventional direct-room naming as 1-1.
+    if room.name and " & " in room.name:
+        try:
+            if room.members is not None and len(room.members) == 2:
+                return False
+        except Exception:
+            # If relationship isn't loaded for some reason, fall back to name heuristic.
+            return False
+    return True
+
+
 def get_current_user(authorization: str = Header(...), db: Session = Depends(get_db)) -> User:
     """
     Dependency: Lấy current user từ JWT token.
@@ -116,9 +135,10 @@ async def list_rooms(
                 logger.debug(f"Note: Could not check unread status: {e}")
                 has_unread = False
             
+            effective_is_group = _is_effective_group(room)
             display_name = room.name
             peer_id = None
-            if not room.is_group:
+            if not effective_is_group:
                 peer = next(
                     (member.user for member in room.members if member.user_id != current_user.id),
                     None,
@@ -134,7 +154,7 @@ async def list_rooms(
             room_list = RoomListResponse(
                 id=room.id,
                 name=room.name,
-                is_group=room.is_group,
+                is_group=effective_is_group,
                 member_count=len(room.members) if room.members else 0,
                 last_message_at=last_message.created_at if last_message else None,
                 display_name=display_name,
@@ -259,12 +279,14 @@ async def get_room(
                 "role": room_member.role,
                 "joined_at": room_member.joined_at.isoformat(),
             })
+
+        effective_is_group = _is_effective_group(room)
         
         return {
             "id": room.id,
             "name": room.name,
             "description": room.description,
-            "is_group": room.is_group,
+            "is_group": effective_is_group,
             "created_by_id": room.created_by_id,
             "created_at": room.created_at.isoformat(),
             "updated_at": room.updated_at.isoformat(),
@@ -359,6 +381,12 @@ async def add_member(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Phòng không tìm thấy",
+            )
+
+        if not _is_effective_group(room):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Không thể thêm thành viên vào chat 1-1",
             )
         
         # Kiểm tra current user là admin/moderator
@@ -473,6 +501,12 @@ async def remove_member(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Phòng không tìm thấy",
+            )
+
+        if not _is_effective_group(room):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Không thể xóa thành viên khỏi chat 1-1",
             )
         
         # Kiểm tra current user là admin/moderator

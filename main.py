@@ -21,6 +21,8 @@ import os
 from datetime import datetime, timezone
 import jwt
 import json
+import asyncio
+import urllib.parse
 
 from app.database.database import init_db, SessionLocal, engine
 from app.core.crypto_bridge import crypto_bridge
@@ -70,19 +72,7 @@ def run_migrations():
                 else:
                     logger.warning(f"⚠️ Could not add read_at column: {e}")
             
-            # Try to add message_hash column (MD5 hash for integrity verification)
-            try:
-                connection.execute(text(
-                    "ALTER TABLE messages ADD COLUMN message_hash VARCHAR(64) NULL"
-                ))
-                logger.info("✅ Added 'message_hash' column to messages table")
-            except Exception as e:
-                if "Duplicate column" in str(e) or "already exists" in str(e):
-                    logger.debug("✓ 'message_hash' column already exists")
-                else:
-                    logger.warning(f"⚠️ Could not add message_hash column: {e}")
-            
-            # Try to add index on is_read
+            # Try to add index
             try:
                 connection.execute(text(
                     "CREATE INDEX idx_messages_is_read ON messages(is_read)"
@@ -270,6 +260,12 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
     }
     """
     
+    user_id = None
+    user_id_norm = None
+    room_id_norm = None
+    username = None
+    room_is_group = False
+
     try:
         # ===== 1. Verify JWT token =====
         try:
@@ -290,44 +286,58 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
             logger.warning(f"WebSocket connection rejected: invalid token - {e}")
             return
         
-        # ===== 2. Verify user exists and room exists =====
-        db = SessionLocal()
+        # ===== 2. Verify user exists and room exists (SHORT-LIVED DB SESSION) =====
+        user_id_norm = normalize_uuid(user_id)
+        room_id_norm = normalize_uuid(room_id)
+
+        db_init = SessionLocal()
         try:
-            user_id_norm = normalize_uuid(user_id)
-            user = db.query(User).filter(User.id == user_id_norm).first()
+            user = db_init.query(User).filter(User.id == user_id_norm).first()
             if not user:
                 await websocket.close(code=4004, reason="User not found")
                 logger.warning(f"WebSocket rejected: user {user_id} not found")
                 return
-            
-            room_id_norm = normalize_uuid(room_id)
-            room = db.query(Room).filter(Room.id == room_id_norm).first()
+
+            # Prefer username from DB to avoid stale token payload
+            username = user.username
+
+            room = db_init.query(Room).filter(Room.id == room_id_norm).first()
             if not room:
                 await websocket.close(code=4005, reason="Room not found")
                 logger.warning(f"WebSocket rejected: room {room_id} not found")
                 return
-            
+
+            room_is_group = bool(room.is_group)
+
             # ===== 3. Verify user is member of room =====
-            member = db.query(RoomMember).filter(
-                (RoomMember.room_id == room_id_norm) & 
-                (RoomMember.user_id == user_id_norm)
+            member = db_init.query(RoomMember).filter(
+                (RoomMember.room_id == room_id_norm)
+                & (RoomMember.user_id == user_id_norm)
             ).first()
-            
+
             if not member:
                 await websocket.close(code=4006, reason="Not a member of this room")
-                logger.warning(f"WebSocket rejected: user {user_id} is not member of room {room_id}")
+                logger.warning(
+                    f"WebSocket rejected: user {user_id} is not member of room {room_id}"
+                )
                 return
-            
-            # ===== 4. Accept connection =====
-            await connection_manager.connect(room_id_norm, user_id_norm, websocket)
-            logger.info(f"[CONNECT] User {user_id_norm[:8]}... vào room {room_id_norm[:8]}... ({connection_manager.get_room_member_count(room_id_norm)} members)")
-            
-            # ===== 5. Connection accepted =====
-            member_count = connection_manager.get_room_member_count(room_id_norm)
-            logger.info(f"[WS] User {user_id[:8]}... connected to room {room_id[:8]}... ({member_count} members)")
-            
-            # ===== 6. Handle incoming messages =====
-            while True:
+        finally:
+            db_init.close()
+
+        # ===== 4. Accept connection =====
+        await connection_manager.connect(room_id_norm, user_id_norm, websocket)
+        logger.info(
+            f"[CONNECT] User {user_id_norm[:8]}... vào room {room_id_norm[:8]}... ({connection_manager.get_room_member_count(room_id_norm)} members)"
+        )
+
+        # ===== 5. Connection accepted =====
+        member_count = connection_manager.get_room_member_count(room_id_norm)
+        logger.info(
+            f"[WS] User {user_id_norm[:8]}... connected to room {room_id_norm[:8]}... ({member_count} members)"
+        )
+
+        # ===== 6. Handle incoming messages =====
+        while True:
                 # Receive message from client
                 data_raw = await websocket.receive_text()
                 
@@ -339,102 +349,121 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     if not content:
                         continue
                     
+                    # [DEBUG] Phase 6: Backend receives from WebSocket
+                    logger.info(f"[🔄 PHASE 6] Backend receives from WebSocket | msg_len={len(content)} | from user {user_id_norm[:8]}... in room {room_id_norm[:8]}...")
+
+                    
                     # ===== 6b. Backend calls Kernel Driver to encrypt =====
                     try:
-                        # Call crypto_bridge to hash message using Driver (IOCTL_HASH_MD5)
-                        # Returns MD5 hash (32 hex chars)
-                        message_hash = await crypto_bridge.hash_message_content(content)
+                        # [DEBUG] Phase 7: Backend encrypts with driver
+                        logger.info(f"[🔐 PHASE 7] Starting encryption with driver | content: {content[:50]} | content_len={len(content)}")
                         
                         # Call crypto_bridge to encrypt message using Driver (IOCTL_ENCRYPT_AES)
                         # Returns encrypted ciphertext (base64 encoded with IV prepended)
                         content_encrypted = await crypto_bridge.encrypt_message_payload(content)
+                        
+                        # [DEBUG] Phase 8: Backend encryption success
+                        logger.info(f"[✅ PHASE 8] Encryption success | encrypted_len={len(content_encrypted)} | encrypted_start: {content_encrypted[:50]}")
+
                     except Exception as e:
-                        logger.error(f"Backend Driver encrypt/hash failed: {e}")
+                        logger.error(f"[❌ ERROR] Backend Driver encrypt failed: {e}")
                         await connection_manager.send_personal_message(
                             room_id_norm,
                             user_id_norm,
                             {
                                 "type": "error",
-                                "message": "Backend encryption/hashing failed",
+                                "message": "Backend encryption failed",
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                             },
                         )
                         continue
                     
-                    # ===== 7. Save message to database (plaintext + encrypted + hash) =====
+                    # ===== 7. Save message to database (BOTH plaintext + encrypted) =====
+                    # [DEBUG] Phase 9: Backend saves to DB
+                    logger.info(f"[💾 PHASE 9] Saving to database | plaintext: {content[:50]} | encrypted: {content_encrypted[:50]}")
+                    
                     message = Message(
                         id=None,  # Auto-generate UUID
                         room_id=room_id_norm,
                         sender_id=user_id_norm,
                         content=content,  # Plaintext for display/logging
                         content_encrypted=content_encrypted,  # Encrypted by Driver
-                        message_hash=message_hash,  # MD5 hash by Driver
                         created_at=datetime.utcnow(),
                         updated_at=datetime.utcnow(),
                     )
                     
-                    db.add(message)
-                    db.commit()
-                    db.refresh(message)
+                    db_msg = SessionLocal()
+                    try:
+                        db_msg.add(message)
+                        db_msg.commit()
+                        db_msg.refresh(message)
+                    except Exception:
+                        db_msg.rollback()
+                        raise
+                    finally:
+                        db_msg.close()
                     
-                    # ===== 8. Broadcast encrypted message + hash to room members =====
-                    # Clients receive encrypted, hash and can decrypt/verify using Web Crypto API
+                    # [DEBUG] Phase 10: Backend saves to DB success
+                    logger.info(f"[✅ PHASE 10] Database saved | message_id: {message.id[:8]}...")
+                    
+                    # ===== 8. Broadcast encrypted message to room members =====
+                    # [DEBUG] Phase 11: Backend broadcasts to room
+                    logger.info(f"[📡 PHASE 11] Broadcasting to room members | room: {room_id_norm[:8]}... | message_id: {message.id[:8]}... | encrypted_len: {len(content_encrypted)}")
+                    
+                    # Clients receive encrypted and can decrypt using Web Crypto API
                     await connection_manager.broadcast_to_room(room_id_norm, {
                         "type": "message",
                         "id": message.id,
                         "room_id": room_id_norm,
                         "sender_id": user_id_norm,
                         "sender_name": user.username,
-                        "content": content,  # For fallback if client can't decrypt
+                        # "content": content,  # For fallback if client can't decrypt
                         "content_encrypted": message.content_encrypted,  # Encrypted by Driver
-                        "message_hash": message.message_hash,  # MD5 hash by Driver for integrity verification
                         "created_at": message.created_at.isoformat(),
                         "updated_at": message.updated_at.isoformat(),
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
                     
-                    logger.debug(f"[MSG] {user.username} → room {room_id_norm[:8]}...: {content[:50]}")
+                    logger.info(f"[✅ PHASE 11+] Broadcast completed | message_id: {message.id[:8]}...")
                 
                 except json.JSONDecodeError:
                     logger.warning(f"Invalid message format from {user_id}")
                     continue
                 except Exception as e:
-                    db.rollback()
-                    logger.error(f"Error processing message: {e}")
+                    logger.error(f"[❌ ERROR] Error processing message: {e}", exc_info=True)
                     continue
-        
-        finally:
-            db.close()
     
     except WebSocketDisconnect:
-        db = SessionLocal()
         try:
-            user_id_norm = normalize_uuid(user_id) if user_id else None
-            user = db.query(User).filter(User.id == user_id_norm).first() if user_id_norm else None
-            username = user.username if user else (user_id_norm[:8] if user_id_norm else "unknown")
-            
-            # Disconnect from connection manager
-            room_id_norm = normalize_uuid(room_id)
-            connection_manager.disconnect(room_id_norm, user_id_norm)
-            
-            member_count = connection_manager.get_room_member_count(room_id_norm)
-            
+            # Best-effort cleanup without holding DB connections
+            if room_id_norm and user_id_norm:
+                connection_manager.disconnect(room_id_norm, user_id_norm)
+
+            member_count = connection_manager.get_room_member_count(room_id_norm) if room_id_norm else 0
+
             # Broadcast system message: user left (group only)
-            if member_count > 0 and room.is_group:
-                await connection_manager.broadcast_to_room(room_id_norm, {
-                    "type": "system",
-                    "content": f"👋 {username} đã rời phòng",
-                    "user_id": user_id_norm,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-            
-            logger.info(f"[DISCONNECT] User {user_id_norm[:8]}... rời room {room_id_norm[:8]}... ({member_count} members còn lại)")
-            logger.info(f"[WS] User {user_id_norm[:8]}... disconnected from room {room_id_norm[:8]}... ({member_count} members left)")
-        
+            if member_count > 0 and room_is_group and room_id_norm and user_id_norm:
+                display_name = username or (user_id_norm[:8] if user_id_norm else "unknown")
+                await connection_manager.broadcast_to_room(
+                    room_id_norm,
+                    {
+                        "type": "system",
+                        "content": f"👋 {display_name} đã rời phòng",
+                        "user_id": user_id_norm,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+
+            if room_id_norm and user_id_norm:
+                logger.info(
+                    f"[DISCONNECT] User {user_id_norm[:8]}... rời room {room_id_norm[:8]}... ({member_count} members còn lại)"
+                )
+                logger.info(
+                    f"[WS] User {user_id_norm[:8]}... disconnected from room {room_id_norm[:8]}... ({member_count} members left)"
+                )
+
         except Exception as e:
             logger.error(f"Error during WebSocket disconnect: {e}")
-        finally:
-            db.close()
     
     except Exception as e:
         logger.error(f"WebSocket error for user {user_id} in room {room_id}: {e}")
@@ -447,6 +476,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
 
 # ==================== WebSocket /ws/notifications ====================
 
+import asyncio
+import urllib.parse
+
 @app.websocket("/ws/notifications")
 async def websocket_notifications(websocket: WebSocket):
     """
@@ -457,6 +489,7 @@ async def websocket_notifications(websocket: WebSocket):
     - Real-time friend notifications
     - Per-user connection management
     - Automatic cleanup on disconnect
+    - Heartbeat mechanism (ping/pong) để giữ connection alive
     
     Usage:
     ws://localhost:8000/ws/notifications?token={JWT_TOKEN}
@@ -475,17 +508,46 @@ async def websocket_notifications(websocket: WebSocket):
     """
     
     user_id = None
+    user_id_norm = None
+    heartbeat_task = None
+    websocket_accepted = False
+    
+    async def safe_close(code: int = 1000, reason: str = ""):
+        """Gracefully close websocket connection"""
+        try:
+            if websocket_accepted:
+                await websocket.close(code=code, reason=reason)
+        except Exception as e:
+            logger.debug(f"Error closing websocket: {e}")
+    
+    async def heartbeat():
+        """Gửi ping định kỳ để giữ connection alive"""
+        try:
+            while True:
+                await asyncio.sleep(30)  # Ping mỗi 30 giây
+                try:
+                    await websocket.send_text("ping")
+                except Exception as e:
+                    logger.debug(f"Heartbeat failed for user {user_id_norm[:8] if user_id_norm else 'unknown'}...: {e}")
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"Heartbeat error: {e}")
     
     try:
-        # ===== 1. Lấy token từ query params =====
-        query_params = dict(
-            param.split("=") for param in websocket.scope.get("query_string", b"").decode().split("&") 
-            if "=" in param
-        )
-        token = query_params.get("token", "").replace("Bearer ", "")
+        # ===== 1. Lấy token từ query params (SAFE PARSING) =====
+        query_string = websocket.scope.get("query_string", b"").decode()
+        
+        # Parse query string an toàn
+        try:
+            parsed_qs = urllib.parse.parse_qs(query_string)
+            token = parsed_qs.get("token", [""])[0].replace("Bearer ", "")
+        except Exception as e:
+            logger.warning(f"Query string parsing error: {e}")
+            return
         
         if not token:
-            await websocket.close(code=4001, reason="Token required")
             logger.warning("Notification WebSocket rejected: no token provided")
             return
         
@@ -495,53 +557,106 @@ async def websocket_notifications(websocket: WebSocket):
             user_id = payload.get("user_id")
             
             if not user_id:
-                await websocket.close(code=4001, reason="Invalid token: no user_id")
                 logger.warning("Notification WebSocket rejected: no user_id in token")
                 return
         except Exception as e:
             logger.warning(f"Notification WebSocket rejected: invalid token - {e}")
-            await websocket.close(code=4001, reason="Invalid token")
             return
+        
+        user_id_norm = normalize_uuid(user_id)
         
         # ===== 3. Verify user exists =====
         db = SessionLocal()
         try:
-            user_id_norm = normalize_uuid(user_id)
             user = db.query(User).filter(User.id == user_id_norm).first()
             if not user:
-                await websocket.close(code=4004, reason="User not found")
-                logger.warning(f"Notification WebSocket rejected: user {user_id} not found")
+                logger.warning(f"Notification WebSocket rejected: user {user_id_norm} not found")
                 return
+        except Exception as e:
+            logger.error(f"Database error during user verification: {e}")
+            return
         finally:
             db.close()
         
-        # ===== 4. Connect user tới notification manager =====
-        await notification_manager.connect(user_id_norm, websocket)
-        logger.info(f"✓ Notification WebSocket connected for user {user_id_norm[:8]}...")
+        # ===== 4. Accept WebSocket connection (AFTER all validations) =====
+        try:
+            await websocket.accept()
+            websocket_accepted = True
+            logger.info(f"✓ Notification WebSocket connected for user {user_id_norm[:8]}...")
+        except Exception as e:
+            logger.error(f"Failed to accept websocket: {e}")
+            return
         
-        # ===== 5. Keep connection alive (ping/pong) =====
+        # ===== 5. Connect user tới notification manager =====
+        # Lưu ý: websocket đã được accept rồi, nên chỉ thêm vào dict
+        notification_manager.active_connections[user_id_norm] = websocket
+        logger.info(f"✓ User {user_id_norm[:8]}... added to notification manager")
+        
+        # ===== 6. Start heartbeat task =====
+        heartbeat_task = asyncio.create_task(heartbeat())
+        
+        # ===== 7. Keep connection alive (ping/pong) =====
         while True:
-            data = await websocket.receive_text()
+            try:
+                data = await websocket.receive_text()
+                
+                # Handle ping/pong để giữ connection sống
+                if data == "ping":
+                    try:
+                        await websocket.send_text("pong")
+                    except Exception as e:
+                        logger.debug(f"Failed to send pong to {user_id_norm[:8]}...: {e}")
+                        break
+                elif data == "pong":
+                    # Ignore pong from client
+                    pass
+                else:
+                    logger.debug(f"Received from {user_id_norm[:8]}...: {data}")
             
-            # Handle ping/pong để giữ connection sống
-            if data == "ping":
-                await websocket.send_text("pong")
-            elif data == "pong":
-                # Ignore pong
-                pass
-            else:
-                logger.debug(f"Received from {user_id[:8]}...: {data}")
-    
-    except WebSocketDisconnect:
-        if user_id:
-            user_id_norm = normalize_uuid(user_id)
-            notification_manager.disconnect(user_id_norm)
-            logger.info(f"✓ Notification WebSocket disconnected for user {user_id_norm[:8]}...")
+            except WebSocketDisconnect:
+                logger.info(f"✓ Notification WebSocket disconnected for user {user_id_norm[:8]}...")
+                break
+            except Exception as e:
+                logger.warning(f"Error receiving data from {user_id_norm[:8]}...: {e}")
+                break
     
     except Exception as e:
-        logger.error(f"Notification WebSocket error for user {user_id}: {e}")
-        if user_id:
-            notification_manager.disconnect(normalize_uuid(user_id))
+        logger.error(f"Notification WebSocket error for user {user_id_norm or user_id or 'unknown'}: {e}")
+    
+    finally:
+        # ===== CLEANUP =====
+        # Hủy heartbeat task
+        if heartbeat_task:
+            try:
+                heartbeat_task.cancel()
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"Error cancelling heartbeat: {e}")
+        
+        # Remove from notification manager
+        if user_id_norm:
+            try:
+                notification_manager.disconnect(user_id_norm)
+                logger.info(f"✓ Cleanup: User {user_id_norm[:8]}... removed from notification manager")
+            except Exception as e:
+                logger.debug(f"Error during cleanup: {e}")
+
+
+# ==================== Server Startup ====================
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("🚀 Starting Secure Chat Backend Server...")
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+        log_level="info"
+    )
+
 
 
 # ==================== Error Handlers ====================
