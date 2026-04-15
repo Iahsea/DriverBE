@@ -378,9 +378,34 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                         )
                         continue
                     
-                    # ===== 7. Save message to database (BOTH plaintext + encrypted) =====
+                    # ===== 6c. Backend calls Kernel Driver to compute MD5 hash =====
+                    try:
+                        # [DEBUG] Phase 8b: Backend computes MD5 hash for integrity verification
+                        logger.info(f"[🔐 PHASE 8b] Computing MD5 hash for integrity verification | content: {content[:50]}")
+                        
+                        # Call crypto_bridge to hash message using Driver (IOCTL_HASH_MD5)
+                        # Returns 32-char hex string
+                        message_hash = await crypto_bridge.hash_message_content(content)
+                        
+                        # [DEBUG] Phase 8c: Backend hash success
+                        logger.info(f"[✅ PHASE 8c] MD5 hash computed | hash: {message_hash[:16]}...")
+                    
+                    except Exception as e:
+                        logger.error(f"[❌ ERROR] Backend Driver hash failed: {e}")
+                        await connection_manager.send_personal_message(
+                            room_id_norm,
+                            user_id_norm,
+                            {
+                                "type": "error",
+                                "message": "Backend MD5 computation failed",
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                        continue
+                    
+                    # ===== 7. Save message to database (BOTH plaintext + encrypted + hash) =====
                     # [DEBUG] Phase 9: Backend saves to DB
-                    logger.info(f"[💾 PHASE 9] Saving to database | plaintext: {content[:50]} | encrypted: {content_encrypted[:50]}")
+                    logger.info(f"[💾 PHASE 9] Saving to database | plaintext: {content[:50]} | encrypted: {content_encrypted[:50]} | hash: {message_hash[:16]}...")
                     
                     message = Message(
                         id=None,  # Auto-generate UUID
@@ -388,6 +413,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                         sender_id=user_id_norm,
                         content=content,  # Plaintext for display/logging
                         content_encrypted=content_encrypted,  # Encrypted by Driver
+                        message_hash=message_hash,  # MD5 hash for integrity verification
                         created_at=datetime.utcnow(),
                         updated_at=datetime.utcnow(),
                     )
@@ -410,7 +436,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     # [DEBUG] Phase 11: Backend broadcasts to room
                     logger.info(f"[📡 PHASE 11] Broadcasting to room members | room: {room_id_norm[:8]}... | message_id: {message.id[:8]}... | encrypted_len: {len(content_encrypted)}")
                     
-                    # Clients receive encrypted and can decrypt using Web Crypto API
+                    # Clients receive encrypted + hash for integrity verification (can decrypt using Web Crypto API)
                     await connection_manager.broadcast_to_room(room_id_norm, {
                         "type": "message",
                         "id": message.id,
@@ -419,6 +445,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                         "sender_name": user.username,
                         # "content": content,  # For fallback if client can't decrypt
                         "content_encrypted": message.content_encrypted,  # Encrypted by Driver
+                        "message_hash": message.message_hash,  # MD5 hash for integrity verification
                         "created_at": message.created_at.isoformat(),
                         "updated_at": message.updated_at.isoformat(),
                         "timestamp": datetime.now(timezone.utc).isoformat(),

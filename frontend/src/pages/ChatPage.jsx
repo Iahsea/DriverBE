@@ -314,7 +314,7 @@ function ChatPage() {
   )
 
   /**
-   * ⭐ REFACTORED: Batch verify messages
+   * ⭐ REFACTORED: Batch verify messages (Backend only)
    */
   const verifyMessagesBatch = useCallback(
     async (batch, roomId) => {
@@ -324,8 +324,7 @@ function ChatPage() {
         batch.map((msg) =>
           performFullVerification(
             { id: msg.id, content_decrypted: msg.plaintext },
-            token,
-            true
+            token
           )
         )
       )
@@ -681,27 +680,35 @@ function ChatPage() {
                   )
                 )
 
-                // Verify
+                // Verify (Backend only)
                 performFullVerification(
                   { id: data.id, content_decrypted: decrypted.plaintext },
-                  token,
-                  true
-                ).then((verification) => {
-                  // Room check again
-                  if (activeRoomIdRef.current !== roomId) return
+                  token
+                )
+                  .then((verification) => {
+                    if (!verification) {
+                      console.warn(`[VERIFY] Verification returned null for ${data.id}`)
+                      return
+                    }
+                    if (activeRoomIdRef.current !== roomId) return
 
-                  setMessages((prev) =>
-                    prev.map((msg) =>
-                      msg.id === data.id
-                        ? {
-                            ...msg,
-                            message_verified: verification.verified,
-                            verification_timestamp: verification.timestamp,
-                          }
-                        : msg
+                    console.log(`[VERIFY] Verification complete for ${data.id}: ${verification.integrity_status}`)
+
+                    setMessages((prev) =>
+                      prev.map((msg) =>
+                        msg.id === data.id
+                          ? {
+                              ...msg,
+                              message_verified: verification.verified,
+                              verification_timestamp: verification.timestamp,
+                            }
+                          : msg
+                      )
                     )
-                  )
-                })
+                  })
+                  .catch((error) => {
+                    console.error(`[VERIFY] Verification error for ${data.id}:`, error)
+                  })
               })
             }
 
@@ -1080,6 +1087,11 @@ function ChatPage() {
                         </Avatar>
                       )}
                       <div className={`message-bubble ${isSelf ? 'sent' : 'received'}`}>
+                        {!isSelf && activeRoom?.is_group && (
+                          <div className="message-sender-name" style={{ fontSize: '12px', fontWeight: '600', color: '#1890ff', marginBottom: '4px' }}>
+                            {item.sender_name || 'Unknown'}
+                          </div>
+                        )}
                         <div className="message-text">
                           {item.content_decrypted || <em style={{ color: '#999' }}>Decrypting...</em>}
                         </div>

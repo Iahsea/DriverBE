@@ -105,18 +105,23 @@ export async function callBackendVerifyIntegrity(messageId, plaintext, authToken
 }
 
 /**
- * Full verification flow:
- * 1. Compute local hash of plaintext
- * 2. Compare with backend hash
- * 3. Optionally call API for backend verification
+ * Full verification flow - Backend Only
  * 
- * @param {object} message - Message object with id, content_decrypted, message_hash
+ * ⭐ NEW: Uses backend verification only (no frontend MD5 computation)
+ * 
+ * Flow:
+ * 1. Call backend API with plaintext
+ * 2. Backend computes MD5 hash using Kernel Driver
+ * 3. Backend compares with stored hash
+ * 4. Return verification result
+ * 
+ * @param {object} message - Message object with id, content_decrypted
  * @param {string} authToken - JWT token for API call
- * @param {boolean} callBackend - Whether to verify with backend API
- * @returns {Promise<object>} - {verified, integrity_status, computed_hash}
+ * @returns {Promise<object>} - {verified, backend_result, status}
  */
-export async function performFullVerification(message, authToken, callBackend = false) {
+export async function performFullVerification(message, authToken) {
   if (!message || !message.content_decrypted) {
+    console.warn(`[VERIFY] No plaintext for message ${message?.id}`)
     return {
       verified: null,
       integrity_status: 'no_plaintext',
@@ -124,29 +129,45 @@ export async function performFullVerification(message, authToken, callBackend = 
     }
   }
 
-  // 1. Local verification
-  const localVerification = await verifyMessageIntegrity(
-    message.content_decrypted,
-    message.message_hash
-  )
-
-  // 2. Optional backend verification
-  let backendResult = null
-  if (callBackend) {
-    backendResult = await callBackendVerifyIntegrity(
+  // ⭐ ONLY backend verification (bỏ frontend MD5)
+  try {
+    console.log(`[VERIFY] Starting backend verification for ${message.id}`)
+    const backendResult = await callBackendVerifyIntegrity(
       message.id,
       message.content_decrypted,
       authToken
     )
-  }
 
-  return {
-    verified: localVerification,
-    integrity_status: localVerification ? 'verified' : localVerification === false ? 'tampered' : 'unknown',
-    computed_hash: '',
-    backend_result: backendResult,
-    message_id: message.id,
-    timestamp: new Date().toISOString(),
+    console.log(`[VERIFY] Backend result:`, backendResult)
+
+    if (!backendResult) {
+      console.warn(`[VERIFY] Backend returned null for ${message.id}`)
+      return {
+        verified: null,
+        integrity_status: 'error',
+        error: 'Backend verification failed',
+      }
+    }
+
+    // Backend returns: {verified, message_hash, computed_hash, status}
+    const status = backendResult.verified ? 'verified' : 'tampered'
+
+    console.log(`[VERIFY] Verification result: ${status}`)
+
+    return {
+      verified: backendResult.verified,
+      integrity_status: status,
+      backend_result: backendResult,
+      message_id: message.id,
+      timestamp: new Date().toISOString(),
+    }
+  } catch (error) {
+    console.error(`[VERIFY] Backend verification error:`, error)
+    return {
+      verified: null,
+      integrity_status: 'error',
+      error: error.message,
+    }
   }
 }
 

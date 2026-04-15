@@ -96,6 +96,18 @@ class DecryptMessageRequest(BaseModel):
         }
 
 
+class VerifyIntegrityRequest(BaseModel):
+    """Schema cho POST /api/v1/messages/{id}/verify-integrity - Xác minh toàn vẹn tin nhắn"""
+    plaintext_received: str = Field(..., description="Plaintext đã decrypt để xác minh")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "plaintext_received": "Hello Client2"
+            }
+        }
+
+
 class DecryptMessageResponse(BaseModel):
     """Schema cho response khi giải mã tin nhắn thành công"""
     id: str = Field(..., description="Message ID")

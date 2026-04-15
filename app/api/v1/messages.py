@@ -10,7 +10,7 @@ Endpoints:
 from fastapi import APIRouter, HTTPException, status, Depends, Header
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
-from app.schemas.message import MessageResponse, MessageListResponse, DecryptMessageRequest, DecryptMessageResponse
+from app.schemas.message import MessageResponse, MessageListResponse, DecryptMessageRequest, DecryptMessageResponse, VerifyIntegrityRequest
 from app.core.security import verify_access_token, get_token_from_header
 from app.core.id_utils import normalize_uuid
 from app.core.crypto_bridge import crypto_bridge
@@ -253,7 +253,7 @@ async def decrypt_message(
 )
 async def verify_message_integrity(
     message_id: str,
-    body: dict,
+    body: VerifyIntegrityRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -309,8 +309,8 @@ async def verify_message_integrity(
                 detail="Bạn không phải member của room chứa message này",
             )
         
-        # Get plaintext from request
-        plaintext_received = body.get("plaintext_received", "")
+        # Get plaintext from request body
+        plaintext_received = body.plaintext_received
         
         # Compute hash of received plaintext
         expected_hash = await crypto_bridge.hash_message_content(plaintext_received)
